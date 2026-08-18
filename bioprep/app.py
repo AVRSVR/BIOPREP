@@ -1,92 +1,258 @@
-import os
-import json
-import time
-import queue
-import shutil
+"""
+BioPrep HTTP layer.
+
+This module handles requests and nothing else: parsing, storage and response
+shaping. All preparation logic lives in ``bioprep.core.pipeline`` so the three
+processing modes cannot drift apart.
+"""
+
 import base64
-import zipfile
+import glob
+import io
+import json
+import logging
+import os
+import shutil
 import tempfile
 import threading
 import uuid
+import zipfile
+from collections import OrderedDict
 from datetime import datetime, timezone
 
-from flask import Flask, render_template, request, send_file, jsonify, Response, stream_with_context
+from flask import Flask, render_template, request, send_file, jsonify
 from werkzeug.utils import secure_filename
 
-# Import BioPrep core logic
-from bioprep.core.io import load_pdb, save_pdb
-from bioprep.core.cleaner import clean_structure
-from bioprep.core.protonator import add_hydrogens
+from bioprep.core.pipeline import PipelineSettings, prepare_structure
+from bioprep.core.io import load_pdb
 from bioprep.core.analyzer import analyze_structure, detect_missing_residues
-from bioprep.core.reporter import build_report, report_to_text, count_atoms_in_pdb
-from bioprep.core.minimizer import minimize_structure
+from bioprep.core.reporter import report_to_text
 from bioprep.core.site_analyzer import BindingSiteAnalyzer
-from bioprep.core.exporter import export_structure
+
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB max
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024   # 200 MB
 
-ALLOWED_EXTENSIONS = {'pdb', 'zip'}
-TEMPLATES_FILE = os.path.join(os.path.dirname(__file__), 'templates_store.json')
-JOBS_FILE = os.path.join(os.path.dirname(__file__), 'jobs_history.json')
-
-# Persistent results store
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'processed_data')
+HERE = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_FILE = os.path.join(HERE, 'templates_store.json')
+JOBS_FILE = os.path.join(HERE, 'jobs_history.json')
+RESULTS_DIR = os.path.join(HERE, 'processed_data')
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# Global state
-batch_progress = {}
-session_pdb_paths = {} # {session_id: {'raw': path, 'current': path}}
-
-
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-def load_templates_store():
-    if os.path.exists(TEMPLATES_FILE):
-        with open(TEMPLATES_FILE, 'r') as f:
-            return json.load(f)
-    return {}
-
-
-def save_templates_store(data):
-    with open(TEMPLATES_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-
-def save_to_history(job_data):
-    """Save an entry to the persistent job history."""
-    history = []
-    if os.path.exists(JOBS_FILE):
-        with open(JOBS_FILE, 'r') as f:
-            try:
-                history = json.load(f)
-            except:
-                history = []
-    
-    history.insert(0, job_data)
-    history = history[:50] # Limit to 50 entries
-    
-    with open(JOBS_FILE, 'w') as f:
-        json.dump(history, f, indent=2)
-
-
-def get_history():
-    """Retrieve all history entries."""
-    if os.path.exists(JOBS_FILE):
-        with open(JOBS_FILE, 'r') as f:
-            try:
-                return json.load(f)
-            except:
-                return []
-    return []
+HISTORY_LIMIT = 50
+SESSION_LIMIT = 200              # bounded so long-running servers do not leak
+MAX_ZIP_MEMBERS = 500
+MAX_ZIP_UNCOMPRESSED = 2 * 1024 ** 3   # 2 GB
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES: Pages
+# Storage helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class JsonStore:
+    """
+    A small JSON file guarded by a lock and written atomically.
+
+    Read-modify-write without either of those corrupts the file when two
+    requests land at once, which is how a 345 KB history file ends up
+    unparseable.
+    """
+
+    def __init__(self, path, default):
+        self._path = path
+        self._default = default
+        self._lock = threading.Lock()
+
+    def read(self):
+        with self._lock:
+            return self._read_unlocked()
+
+    def _read_unlocked(self):
+        if not os.path.exists(self._path):
+            return json.loads(json.dumps(self._default))
+        try:
+            with open(self._path, 'r', encoding='utf-8') as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read %s; starting fresh", self._path)
+            return json.loads(json.dumps(self._default))
+
+    def update(self, mutator):
+        """Apply ``mutator`` to the stored value and persist the result."""
+        with self._lock:
+            data = self._read_unlocked()
+            data = mutator(data)
+            tmp_path = f'{self._path}.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, indent=2)
+            os.replace(tmp_path, self._path)   # atomic on POSIX and Windows
+            return data
+
+
+templates_store = JsonStore(TEMPLATES_FILE, {})
+jobs_store = JsonStore(JOBS_FILE, [])
+
+
+class SessionStore:
+    """Bounded map of session id -> stored structure path."""
+
+    def __init__(self, limit):
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._items = OrderedDict()
+
+    def put(self, session_id, path):
+        with self._lock:
+            self._items[session_id] = path
+            self._items.move_to_end(session_id)
+            while len(self._items) > self._limit:
+                _, evicted = self._items.popitem(last=False)
+                _quietly_remove(evicted)
+
+    def get(self, session_id):
+        with self._lock:
+            path = self._items.get(session_id)
+            if path:
+                self._items.move_to_end(session_id)
+            return path
+
+
+sessions = SessionStore(SESSION_LIMIT)
+
+
+def _quietly_remove(path):
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _store_result(session_id, source_path):
+    """Copy a prepared structure into persistent storage; return its path."""
+    destination = os.path.join(RESULTS_DIR, f'{session_id}.pdb')
+    shutil.copy2(source_path, destination)
+    sessions.put(session_id, destination)
+    return destination
+
+
+def _record_job(session_id, filename, report, status='success'):
+    minimization = report.get('energy_minimization') or {}
+    entry = {
+        'id': session_id,
+        'filename': filename,
+        'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
+        'status': status,
+        'energy_before': minimization.get('energy_before_kJ_mol'),
+        'energy_after': minimization.get('energy_after_kJ_mol'),
+        'minimization_status': minimization.get('status'),
+        'format': (report.get('docking_target') or 'PDB').upper(),
+        'report': report,
+    }
+
+    def mutator(history):
+        if not isinstance(history, list):
+            history = []
+        history.insert(0, entry)
+        for stale in history[HISTORY_LIMIT:]:
+            _quietly_remove(os.path.join(RESULTS_DIR, f"{stale.get('id')}.pdb"))
+        return history[:HISTORY_LIMIT]
+
+    jobs_store.update(mutator)
+
+
+def _send_and_cleanup(path, workdir, download_name, mimetype):
+    """
+    Send a generated archive and remove its working directory immediately.
+
+    The archive is read into memory first. Streaming straight from disk would
+    keep the file open past the end of the view, so the directory could only be
+    removed by a ``call_on_close`` hook — and that hook depends on the WSGI
+    server closing the iterable, which is not guaranteed. Deferred cleanup that
+    quietly does not happen is what left 22 orphaned directories behind before.
+    """
+    with open(path, 'rb') as fh:
+        payload = io.BytesIO(fh.read())
+    shutil.rmtree(workdir, ignore_errors=True)
+    payload.seek(0)
+    return send_file(payload, as_attachment=True,
+                     download_name=download_name, mimetype=mimetype)
+
+
+def _sweep_orphaned_workdirs():
+    """
+    Remove bioprep working directories left by a previous crash.
+
+    Cleanup inside each request is the primary mechanism; this only catches
+    directories orphaned by a hard kill.
+    """
+    import time as _time
+    cutoff = _time.time() - 3600
+    pattern = os.path.join(tempfile.gettempdir(), 'bioprep_*')
+    for path in glob.glob(pattern):
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+                logger.info("Removed orphaned working directory %s", path)
+        except OSError:
+            pass
+
+
+def _fail(message, status=400, **extra):
+    payload = {'error': message}
+    payload.update(extra)
+    return jsonify(payload), status
+
+
+def _server_error(message, exc):
+    """Log the detail, return a generic message. Tracebacks leak paths."""
+    logger.exception(message)
+    return jsonify({'error': f'{message}. See server logs for details.'}), 500
+
+
+def _require_pdb_upload(field='file'):
+    if field not in request.files:
+        return None, _fail('No file was uploaded.')
+    upload = request.files[field]
+    if not upload.filename:
+        return None, _fail('No file was selected.')
+    if not upload.filename.lower().endswith('.pdb'):
+        return None, _fail('Only .pdb files are accepted.')
+    return upload, None
+
+
+def _settings_from_form():
+    """Precision mode posts a flat multipart form."""
+    data = {}
+    for key in ('remove_water', 'keep_structural_waters', 'reconstruct_loops',
+                'add_missing_atoms', 'run_minimization', 'use_gbsa',
+                'ph', 'force_field', 'docking_target'):
+        if key in request.form:
+            data[key] = request.form.get(key)
+
+    for key in ('chains', 'remove_heteros', 'protect_ligands'):
+        raw = request.form.get(key, '[]')
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = []
+        data[key] = parsed
+
+    return PipelineSettings.from_mapping(data)
+
+
+def _settings_from_config():
+    """Batch and high-throughput modes post a `config` JSON blob."""
+    try:
+        config = json.loads(request.form.get('config', '{}'))
+    except json.JSONDecodeError:
+        config = {}
+    return PipelineSettings.from_mapping(config)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pages
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -95,630 +261,419 @@ def index():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES: Analysis
+# Analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    """Reads the uploaded PDB and returns structural metadata."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+    """Return structural metadata for an uploaded PDB without processing it."""
+    upload, error = _require_pdb_upload()
+    if error:
+        return error
 
-    file = request.files['file']
-    if file.filename == '' or not file.filename.lower().endswith('.pdb'):
-        return jsonify({'error': 'Invalid file'}), 400
-
+    workdir = tempfile.mkdtemp(prefix='bioprep_analyze_')
     try:
-        filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"raw_anlz_{filename}")
-        file.save(input_path)
+        input_path = os.path.join(workdir, secure_filename(upload.filename))
+        upload.save(input_path)
 
-        structure = load_pdb(input_path)
-        metadata = analyze_structure(structure)
+        metadata = analyze_structure(load_pdb(input_path))
         metadata['missing_residues'] = detect_missing_residues(input_path)
 
         session_id = str(uuid.uuid4())
-        session_pdb_paths[session_id] = {'raw': input_path, 'current': input_path}
+        _store_result(session_id, input_path)
 
         return jsonify({
-            'success': True, 
-            'filename': filename, 
+            'success': True,
+            'filename': secure_filename(upload.filename),
             'metadata': metadata,
-            'session_id': session_id
+            'session_id': session_id,
         })
-    except Exception as e:
-        return jsonify({'error': f"Analysis failed: {str(e)}"}), 500
+    except Exception as exc:
+        return _server_error('Analysis failed', exc)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES: Precision Mode (single PDB)
+# Precision mode
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/process', methods=['POST'])
 def process():
-    """Precision Mode – single PDB, full control, returns JSON with PDB + report."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+    """Prepare a single structure and return the result inline."""
+    upload, error = _require_pdb_upload()
+    if error:
+        return error
 
-    file = request.files['file']
-    if file.filename == '' or not file.filename.lower().endswith('.pdb'):
-        return jsonify({'error': 'Invalid file'}), 400
-
+    settings = _settings_from_form()
+    session_id = str(uuid.uuid4())
+    workdir = tempfile.mkdtemp(prefix='bioprep_process_')
     try:
-        t_start = time.time()
+        filename = secure_filename(upload.filename)
+        input_path = os.path.join(workdir, filename)
+        upload.save(input_path)
 
-        # Generate session_id early for persistent storage
-        session_id = str(uuid.uuid4())
+        outcome = prepare_structure(input_path, workdir, settings,
+                                    original_filename=filename)
+        report = outcome['report']
 
-        # ── Parse parameters ──────────────────────────────────────────────────
-        chains_input = request.form.get('chains', '[]')
-        chains_to_keep = json.loads(chains_input) if chains_input != '[]' else None
+        _store_result(session_id, outcome['viewer_path'])
+        _record_job(session_id, filename, report)
 
-        remove_water = request.form.get('remove_water', 'true').lower() == 'true'
+        with open(outcome['viewer_path'], 'rb') as fh:
+            viewer_b64 = base64.b64encode(fh.read()).decode('ascii')
 
-        hets_input = request.form.get('remove_heteros', '[]')
-        hets_to_remove = json.loads(hets_input)
-
-        protect_ligands_input = request.form.get('protect_ligands', '[]')
-        protect_ligands = json.loads(protect_ligands_input)
-
-        ph_input = request.form.get('ph', '7.4')
-        try:
-            target_ph = float(ph_input)
-        except ValueError:
-            target_ph = 7.4
-
-        keep_structural_waters = request.form.get('keep_structural_waters', 'false').lower() == 'true'
-        reconstruct_loops = request.form.get('reconstruct_loops', 'false').lower() == 'true'
-        add_missing_atoms_flag = request.form.get('add_missing_atoms', 'false').lower() == 'true'
-        run_minimization = request.form.get('run_minimization', 'false').lower() == 'true'
-        use_gbsa = request.form.get('use_gbsa', 'true').lower() == 'true'
-        force_field = request.form.get('force_field', 'amber14')
-        docking_target = request.form.get('docking_target', '') or None
-
-        # ── Save uploaded file ────────────────────────────────────────────────
-        filename = secure_filename(file.filename)
-        input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"raw_{filename}")
-        file.save(input_path)
-
-        base_name = os.path.splitext(filename)[0]
-        temp_cleaned_path = os.path.join(app.config['UPLOAD_FOLDER'], f"temp_{base_name}.pdb")
-        protonated_path = os.path.join(app.config['UPLOAD_FOLDER'], f"prot_{base_name}.pdb")
-        final_output_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{base_name}_clean.pdb")
-
-        # ── Pre-processing analysis ───────────────────────────────────────────
-        structure = load_pdb(input_path)
-        pre_meta = analyze_structure(structure)
-        atoms_before = pre_meta['atoms_total']
-        all_chains = pre_meta['chains']
-        all_hets = pre_meta['heteroatoms']
-        water_count_before = pre_meta['water_count']
-        missing_residues = detect_missing_residues(input_path)
-
-        # Determine what will actually be removed for report
-        hets_actually_removed = [h for h in hets_to_remove if h not in protect_ligands]
-        hets_retained = [h for h in all_hets if h not in hets_actually_removed]
-
-        # ── Step 1: Clean ─────────────────────────────────────────────────────
-        select_obj = clean_structure(
-            structure,
-            target_chains=chains_to_keep,
-            remove_water=remove_water,
-            remove_heteroatoms=hets_actually_removed,
-            keep_structural_waters=keep_structural_waters,
-        )
-        save_pdb(structure, temp_cleaned_path, select=select_obj)
-
-        # ── Step 2: Protonate ─────────────────────────────────────────────────
-        add_hydrogens(
-            temp_cleaned_path,
-            protonated_path,
-            ph=target_ph,
-            reconstruct_loops=reconstruct_loops,
-            add_missing_atoms=add_missing_atoms_flag,
-        )
-
-        # ── Step 3: Optional energy minimization ──────────────────────────────
-        minimization_stats = None
-        if run_minimization:
-            minimization_stats = minimize_structure(protonated_path, final_output_path, force_field=force_field, use_gbsa=use_gbsa)
+        # Only encode a second copy when the download really is a different
+        # file; otherwise the response carried the structure twice.
+        if outcome['download_path'] == outcome['viewer_path']:
+            download_b64 = viewer_b64
+            download_name = filename
         else:
-            shutil.copy2(protonated_path, final_output_path)
-
-        # ── Count atoms after ─────────────────────────────────────────────────
-        atoms_after = count_atoms_in_pdb(final_output_path)
-
-        # ── Recount missing residues after repair ─────────────────────────────
-        if reconstruct_loops or add_missing_atoms_flag:
-            missing_residues_after = detect_missing_residues(final_output_path)
-        else:
-            missing_residues_after = missing_residues
-
-        # ── Build report ──────────────────────────────────────────────────────
-        report = build_report(
-            filename=filename,
-            chains_detected=all_chains,
-            chains_retained=chains_to_keep if chains_to_keep else all_chains,
-            waters_removed=water_count_before if remove_water else 0,
-            heteroatoms_removed=hets_actually_removed,
-            heteroatoms_retained=hets_retained,
-            hydrogens_added=True,
-            ph_used=target_ph,
-            missing_residues=missing_residues_after,
-            atoms_before=atoms_before,
-            atoms_after=atoms_after,
-            minimization_stats=minimization_stats,
-            docking_target=docking_target,
-            processing_time_s=time.time() - t_start,
-        )
-
-        # ── Step 4: Export Formatting ─────────────────────────────────────────
-        viewer_path = final_output_path
-        if docking_target:
-            success, export_res = export_structure(final_output_path, final_output_path, docking_target)
-            if success and str(export_res).endswith('.pdbqt'):
-                final_output_path = str(export_res)
-                # Filename in response should reflect the change
-                filename = os.path.basename(final_output_path)
-
-        # ── Persist structure for history viewing after restart ─────────────
-        persistent_path = os.path.join(RESULTS_DIR, f"{session_id}.pdb")
-        shutil.copy2(viewer_path, persistent_path) # Use viewer_path for persistent storage
-
-        # ── Encode results as base64 for JSON response ───────────────────
-        with open(viewer_path, 'rb') as f_view:
-            viewer_b64 = base64.b64encode(f_view.read()).decode('utf-8')
-            
-        with open(final_output_path, 'rb') as f_out:
-            download_b64 = base64.b64encode(f_out.read()).decode('utf-8')
-
-        session_pdb_paths[session_id] = {
-            'raw': input_path, 
-            'current': viewer_path,  # Use viewer path for history 3D rendering
-            'download': final_output_path
-        }
-
-        # ── Record job to history ─────────────────────────────────────────────
-        job_info = {
-            'id': session_id,
-            'filename': filename,
-            'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M'),
-            'energy_before': minimization_stats['energy_before_kJ_mol'] if minimization_stats else 'N/A',
-            'energy_after': minimization_stats['energy_after_kJ_mol'] if minimization_stats else 'N/A',
-            'status': 'success',
-            'format': (docking_target.upper() if docking_target else 'PDB'),
-            'report': report
-        }
-        save_to_history(job_info)
+            with open(outcome['download_path'], 'rb') as fh:
+                download_b64 = base64.b64encode(fh.read()).decode('ascii')
+            download_name = os.path.basename(outcome['download_path'])
 
         return jsonify({
             'success': True,
-            'filename': filename,
+            'filename': download_name,
             'report': report,
             'report_text': report_to_text(report),
+            'warnings': outcome['warnings'],
             'viewer_pdb_b64': viewer_b64,
             'pdb_b64': download_b64,
-            'session_id': session_id
+            'session_id': session_id,
         })
 
-    except Exception as e:
-        return jsonify({'error': f"Processing failed: {str(e)}"}), 500
-
-
-@app.route('/api/history', methods=['GET'])
-def list_history():
-    """Return the list of past jobs."""
-    return jsonify(get_history())
-
-
-@app.route('/api/history/pdb/<job_id>', methods=['GET'])
-def get_history_pdb(job_id):
-    """Retrieve the PDB content for a historical job if it still exists."""
-    # Try memory first
-    path_data = session_pdb_paths.get(job_id)
-    pdb_path = path_data.get('current') if path_data else None
-
-    # Fallback to persistent storage
-    if not pdb_path or not os.path.exists(pdb_path):
-        pdb_path = os.path.join(RESULTS_DIR, f"{job_id}.pdb")
-
-    if not os.path.exists(pdb_path):
-        return "Structure no longer available on this server.", 404
-
-    return send_file(pdb_path, mimetype='text/plain')
-
-
-# (Redundant template routes removed, consolidated at bottom of file)
+    except ValueError as exc:
+        # Expected, user-correctable problems.
+        return _fail(str(exc))
+    except Exception as exc:
+        return _server_error('Processing failed', exc)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES: Batch Mode (multiple PDB files)
+# Batch mode
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _process_many(named_streams, settings, workdir):
+    """
+    Prepare several structures into ``workdir/output``.
+
+    ``named_streams`` yields (filename, save_callable). Returns
+    (output_dir, results).
+    """
+    output_dir = os.path.join(workdir, 'output')
+    os.makedirs(output_dir, exist_ok=True)
+    results = []
+    used_names = set()
+
+    for filename, save in named_streams:
+        safe_name = secure_filename(filename)
+        if not safe_name.lower().endswith('.pdb'):
+            results.append({'file': filename, 'status': 'skipped',
+                            'reason': 'not a .pdb file'})
+            continue
+
+        item_dir = os.path.join(workdir, f'item_{len(results)}')
+        os.makedirs(item_dir, exist_ok=True)
+        try:
+            input_path = os.path.join(item_dir, safe_name)
+            save(input_path)
+
+            outcome = prepare_structure(input_path, item_dir, settings,
+                                        original_filename=safe_name)
+
+            base = os.path.splitext(safe_name)[0]
+            extension = os.path.splitext(outcome['download_path'])[1]
+            out_name = f'{base}_prepared{extension}'
+            suffix = 1
+            while out_name.lower() in used_names:
+                out_name = f'{base}_{suffix}_prepared{extension}'
+                suffix += 1
+            used_names.add(out_name.lower())
+
+            shutil.copy2(outcome['download_path'],
+                         os.path.join(output_dir, out_name))
+            results.append({'file': safe_name, 'status': 'success',
+                            'output': out_name, 'report': outcome['report']})
+        except Exception as exc:
+            logger.exception("Failed to prepare %s", safe_name)
+            results.append({'file': safe_name, 'status': 'failed',
+                            'reason': str(exc)})
+        finally:
+            shutil.rmtree(item_dir, ignore_errors=True)
+
+    return output_dir, results
+
+
+def _summary_text(title, results, settings, elapsed):
+    successful = [r for r in results if r['status'] == 'success']
+    failed = [r for r in results if r['status'] == 'failed']
+    skipped = [r for r in results if r['status'] == 'skipped']
+
+    lines = [
+        '=' * 60,
+        f'         BIOPREP - {title}',
+        '=' * 60,
+        f"  Generated  : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f'  Total      : {len(results)}',
+        f'  Succeeded  : {len(successful)}',
+        f'  Failed     : {len(failed)}',
+        f'  Skipped    : {len(skipped)}',
+        f'  Total time : {round(elapsed, 2)} s',
+        '',
+        '-- SETTINGS USED --------------------------------------------',
+    ]
+    for key, value in settings.to_dict().items():
+        lines.append(f'  {key:<24}: {value}')
+
+    if failed or skipped:
+        lines += ['', '-- NOT PROCESSED --------------------------------------------']
+        for r in failed + skipped:
+            lines.append(f"  {r['file']}: {r.get('reason', 'unknown')}")
+
+    lines += ['', '-- INDIVIDUAL REPORTS ---------------------------------------']
+    for r in successful:
+        lines.append(report_to_text(r['report']))
+
+    return '\n'.join(lines)
+
 
 @app.route('/api/batch', methods=['POST'])
-def batch_process():
-    """
-    Batch Mode – accept multiple PDB files + settings JSON.
-    Returns a ZIP with cleaned PDBs + processing_report.txt.
-    """
+def batch():
+    """Prepare several uploaded PDBs and return them as a ZIP."""
+    import time
+    uploads = request.files.getlist('files')
+    if not uploads:
+        return _fail('No files were uploaded.')
+
+    settings = _settings_from_config()
+    workdir = tempfile.mkdtemp(prefix='bioprep_batch_')
+    started = time.time()
     try:
-        files = request.files.getlist('files')
-        if not files:
-            return jsonify({'error': 'No files uploaded'}), 400
+        streams = [(u.filename, u.save) for u in uploads]
+        output_dir, results = _process_many(streams, settings, workdir)
 
-        config_input = request.form.get('config', '{}')
-        try:
-            config = json.loads(config_input)
-        except json.JSONDecodeError:
-            return jsonify({'error': 'Invalid config JSON'}), 400
+        if not any(r['status'] == 'success' for r in results):
+            shutil.rmtree(workdir, ignore_errors=True)
+            return _fail('No files could be prepared.', details=results)
 
-        # Parse config
-        chains_to_keep = config.get('chains', None)
-        remove_water = config.get('remove_water', True)
-        hets_to_remove = config.get('remove_heteros', [])
-        protect_ligands = config.get('protect_ligands', [])
-        target_ph = float(config.get('ph', 7.4))
-        keep_structural_waters = config.get('keep_structural_waters', False)
-        reconstruct_loops = config.get('reconstruct_loops', False)
-        add_missing_atoms_flag = config.get('add_missing_atoms', False)
-        run_minimization = config.get('run_minimization', False)
-        use_gbsa = config.get('use_gbsa', True)
-        force_field = config.get('force_field', 'amber14')
-        docking_target = config.get('docking_target') or None
+        with open(os.path.join(output_dir, 'processing_report.txt'),
+                  'w', encoding='utf-8') as fh:
+            fh.write(_summary_text('BATCH PROCESSING REPORT', results,
+                                   settings, time.time() - started))
 
-        batch_dir = tempfile.mkdtemp(prefix="bioprep_batch_")
-        output_dir = os.path.join(batch_dir, 'output')
-        os.makedirs(output_dir, exist_ok=True)
-
-        results = []
-        total_waters_removed = 0
-        t_batch_start = time.time()
-
-        hets_actually_removed = [h for h in hets_to_remove if h not in protect_ligands]
-
-        for file in files:
-            if not file.filename.lower().endswith('.pdb'):
-                results.append({'file': file.filename, 'status': 'skipped', 'reason': 'not a PDB'})
-                continue
-
-            fname = secure_filename(file.filename)
-            base_name = os.path.splitext(fname)[0]
-            in_path = os.path.join(batch_dir, fname)
-            temp_path = os.path.join(batch_dir, f"temp_{base_name}.pdb")
-            prot_path = os.path.join(batch_dir, f"prot_{base_name}.pdb")
-            out_path = os.path.join(output_dir, f"{base_name}_clean.pdb")
-
-            try:
-                file.save(in_path)
-                structure = load_pdb(in_path)
-                pre_meta = analyze_structure(structure)
-                atoms_before = pre_meta['atoms_total']
-                water_count_before = pre_meta['water_count']
-                missing_residues = detect_missing_residues(in_path)
-
-                select_obj = clean_structure(
-                    structure,
-                    target_chains=chains_to_keep,
-                    remove_water=remove_water,
-                    remove_heteroatoms=hets_actually_removed,
-                    keep_structural_waters=keep_structural_waters,
-                )
-                save_pdb(structure, temp_path, select=select_obj)
-                add_hydrogens(temp_path, prot_path, ph=target_ph,
-                             reconstruct_loops=reconstruct_loops,
-                             add_missing_atoms=add_missing_atoms_flag)
-
-                mini_stats = None
-                if run_minimization:
-                    mini_stats = minimize_structure(prot_path, out_path, force_field=force_field, use_gbsa=use_gbsa)
-                else:
-                    shutil.copy2(prot_path, out_path)
-
-                atoms_after = count_atoms_in_pdb(out_path)
-                total_waters_removed += int(water_count_before) if remove_water else 0
-
-                chains_retained = chains_to_keep if chains_to_keep else pre_meta['chains']
-                all_hets = pre_meta['heteroatoms']
-                hets_retained = [h for h in all_hets if h not in hets_actually_removed]
-
-                report = build_report(
-                    filename=fname,
-                    chains_detected=pre_meta['chains'],
-                    chains_retained=chains_retained,
-                    waters_removed=water_count_before if remove_water else 0,
-                    heteroatoms_removed=hets_actually_removed,
-                    heteroatoms_retained=hets_retained,
-                    hydrogens_added=True,
-                    ph_used=target_ph,
-                    missing_residues=missing_residues,
-                    atoms_before=atoms_before,
-                    atoms_after=atoms_after,
-                    minimization_stats=mini_stats,
-                    docking_target=docking_target,
-                )
-                results.append({'file': fname, 'status': 'success', 'report': report})
-
-            except Exception as e:
-                results.append({'file': fname, 'status': 'failed', 'reason': str(e)})
-
-        # Build batch report text
-        successful = [r for r in results if r.get('status') == 'success']
-        failed = [r for r in results if r.get('status') == 'failed']
-        avg_waters = (total_waters_removed / len(successful)) if successful else 0
-        elapsed = round(time.time() - t_batch_start, 2)
-
-        batch_report_lines = [
-            "=" * 60,
-            "         BIOPREP – BATCH PROCESSING REPORT",
-            "=" * 60,
-            f"  Generated       : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-            f"  Total uploaded  : {len(files)}",
-            f"  Successfully processed : {len(successful)}",
-            f"  Failed          : {len(failed)}",
-            f"  Avg waters removed : {avg_waters:.1f}",
-            f"  Total time      : {elapsed} s",
-            "",
-            "── FAILED FILES ────────────────────────────────────────────",
-        ]
-        if failed:
-            for r in failed:
-                batch_report_lines.append(f"  {r['file']}: {r.get('reason', 'unknown error')}")
-        else:
-            batch_report_lines.append("  None")
-
-        batch_report_lines += [
-            "",
-            "── INDIVIDUAL REPORTS ──────────────────────────────────────",
-        ]
-        for r in successful:
-            if 'report' in r:
-                batch_report_lines.append(report_to_text(r['report']))
-
-        batch_report_text = "\n".join(batch_report_lines)
-
-        # Write individual PDB reports alongside output files
-        with open(os.path.join(output_dir, 'processing_report.txt'), 'w', encoding='utf-8') as f:
-            f.write(batch_report_text)
-
-        # Package everything into a ZIP
-        output_zip_base = os.path.join(batch_dir, "bioprep_batch_results")
-        shutil.make_archive(output_zip_base, 'zip', output_dir)
-        output_zip_path = output_zip_base + ".zip"
-
-        if not successful:
-            return jsonify({'error': 'No files were successfully processed', 'details': results}), 400
-
-        return send_file(
-            output_zip_path,
-            as_attachment=True,
-            download_name="bioprep_batch_results.zip",
-            mimetype="application/zip",
-        )
-    except Exception as e:
-        return jsonify({'error': f"Batch processing crashed: {str(e)}"}), 500
+        archive = shutil.make_archive(
+            os.path.join(workdir, 'bioprep_batch_results'), 'zip', output_dir)
+        return _send_and_cleanup(archive, workdir,
+                                 'bioprep_batch_results.zip', 'application/zip')
+    except Exception as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return _server_error('Batch processing failed', exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES: High-Throughput Mode (ZIP in / ZIP out)
+# High-throughput mode
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_extract(zip_path, destination):
+    """Extract a ZIP with member-count and expanded-size limits."""
+    with zipfile.ZipFile(zip_path) as archive:
+        members = [m for m in archive.infolist() if not m.is_dir()]
+        if len(members) > MAX_ZIP_MEMBERS:
+            raise ValueError(
+                f'Archive contains {len(members)} files; the limit is '
+                f'{MAX_ZIP_MEMBERS}.')
+        total = sum(m.file_size for m in members)
+        if total > MAX_ZIP_UNCOMPRESSED:
+            raise ValueError(
+                f'Archive expands to {total // 1024 ** 2} MB; the limit is '
+                f'{MAX_ZIP_UNCOMPRESSED // 1024 ** 2} MB.')
+        archive.extractall(destination)
+
 
 @app.route('/api/high-throughput', methods=['POST'])
 def high_throughput():
-    """
-    High-Throughput Mode – accept a ZIP of PDBs, auto-pipeline, return ZIP + logs.
-    Supports large batches (50–200+ structures).
-    """
+    """Prepare every PDB inside an uploaded ZIP and return a ZIP of results."""
+    import time
     if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
+        return _fail('No file was uploaded.')
+    upload = request.files['file']
+    if not upload.filename or not upload.filename.lower().endswith('.zip'):
+        return _fail('Please upload a .zip archive containing PDB files.')
 
-    file = request.files['file']
-    if not file.filename.lower().endswith('.zip'):
-        return jsonify({'error': 'Please upload a .zip file containing PDB files'}), 400
-
-    config_input = request.form.get('config', '{}')
+    settings = _settings_from_config()
+    workdir = tempfile.mkdtemp(prefix='bioprep_ht_')
+    started = time.time()
     try:
-        config = json.loads(config_input)
-    except json.JSONDecodeError:
-        config = {}
+        zip_path = os.path.join(workdir, secure_filename(upload.filename))
+        upload.save(zip_path)
 
-    remove_water = config.get('remove_water', True)
-    hets_to_remove = config.get('remove_heteros', [])
-    protect_ligands = config.get('protect_ligands', [])
-    target_ph = float(config.get('ph', 7.4))
-    run_minimization = config.get('run_minimization', False)
-    force_field = config.get('force_field', 'amber14')
-    reconstruct_loops = config.get('reconstruct_loops', False)
-    add_missing_atoms_flag = config.get('add_missing_atoms', False)
-    use_gbsa = config.get('use_gbsa', True)
-    docking_target = config.get('docking_target') or None
+        extract_dir = os.path.join(workdir, 'input')
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            _safe_extract(zip_path, extract_dir)
+        except (zipfile.BadZipFile, ValueError) as exc:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return _fail(f'Could not read archive: {exc}')
 
-    ht_dir = tempfile.mkdtemp(prefix="bioprep_ht_")
-    extract_dir = os.path.join(ht_dir, 'input')
-    output_dir = os.path.join(ht_dir, 'output')
-    os.makedirs(extract_dir, exist_ok=True)
-    os.makedirs(output_dir, exist_ok=True)
+        discovered = []
+        for root, _, names in os.walk(extract_dir):
+            for name in names:
+                if name.lower().endswith('.pdb'):
+                    source = os.path.join(root, name)
+                    discovered.append(
+                        (name, (lambda src: lambda dst: shutil.copy2(src, dst))(source))
+                    )
 
-    zip_path = os.path.join(ht_dir, secure_filename(file.filename))
-    file.save(zip_path)
+        if not discovered:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return _fail('The archive contained no .pdb files.')
 
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zp:
-            zp.extractall(extract_dir)
-    except Exception as e:
-        return jsonify({'error': f"Failed to extract ZIP: {str(e)}"}), 400
+        output_dir, results = _process_many(discovered, settings, workdir)
 
-    logs = []
-    processed = 0
-    failed_list = []
-    t_start = time.time()
-    hets_actually_removed = [h for h in hets_to_remove if h not in protect_ligands]
+        if not any(r['status'] == 'success' for r in results):
+            shutil.rmtree(workdir, ignore_errors=True)
+            return _fail('No structures could be prepared.', details=results)
 
-    for root, _, files_list in os.walk(extract_dir):
-        for fname in files_list:
-            if not fname.lower().endswith('.pdb'):
-                continue
-            in_path = os.path.join(root, fname)
-            base_name = os.path.splitext(fname)[0]
-            
-            # Prevent naming collisions in bulk output
-            final_fname = f"{base_name}_clean.pdb"
-            counter = 1
-            while os.path.exists(os.path.join(output_dir, final_fname)):
-                final_fname = f"{base_name}_{counter}_clean.pdb"
-                counter += 1
-                
-            temp_path = os.path.join(ht_dir, f"temp_{base_name}_{counter}.pdb")
-            prot_path = os.path.join(ht_dir, f"prot_{base_name}_{counter}.pdb")
-            out_path = os.path.join(output_dir, final_fname)
+        with open(os.path.join(output_dir, 'processing_logs.txt'),
+                  'w', encoding='utf-8') as fh:
+            fh.write(_summary_text('HIGH-THROUGHPUT PROCESSING LOG', results,
+                                   settings, time.time() - started))
 
-            try:
-                structure = load_pdb(in_path)
-                pre_meta = analyze_structure(structure)
-                select_obj = clean_structure(
-                    structure,
-                    remove_water=remove_water,
-                    remove_heteroatoms=hets_actually_removed,
-                )
-                save_pdb(structure, temp_path, select=select_obj)
-                add_hydrogens(temp_path, prot_path, ph=target_ph,
-                             reconstruct_loops=reconstruct_loops,
-                             add_missing_atoms=add_missing_atoms_flag)
-
-                if run_minimization:
-                    minimize_structure(prot_path, out_path, force_field=force_field, use_gbsa=use_gbsa)
-                else:
-                    shutil.copy2(prot_path, out_path)
-
-                atoms_after = count_atoms_in_pdb(out_path)
-                logs.append(f"[OK]  {fname}  →  {atoms_after} atoms")
-                processed += 1
-            except Exception as e:
-                logs.append(f"[FAIL] {fname}: {str(e)}")
-                failed_list.append(fname)
-
-    elapsed = round(time.time() - t_start, 2)
-    log_header = [
-        "=" * 60,
-        "    BIOPREP – HIGH-THROUGHPUT PROCESSING LOG",
-        "=" * 60,
-        f"  Generated  : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        f"  Processed  : {processed}",
-        f"  Failed     : {len(failed_list)}",
-        f"  Total time : {elapsed} s",
-        "=" * 60,
-        "",
-    ]
-    full_log = "\n".join(log_header + logs)
-    with open(os.path.join(output_dir, 'processing_logs.txt'), 'w', encoding='utf-8') as f:
-        f.write(full_log)
-
-    output_zip_base = os.path.join(ht_dir, "bioprep_ht_results")
-    shutil.make_archive(output_zip_base, 'zip', output_dir)
-    output_zip_path = output_zip_base + ".zip"
-
-    if processed == 0:
-        return jsonify({'error': 'No valid PDB files were processed', 'log': full_log}), 400
-
-    # FIX: Cleanup batch_progress entry to prevent memory leak on long-running server.
-    # high_throughput uses ht_dir as the identifier, not session_id.
-    batch_progress.pop(ht_dir, None)
-
-    return send_file(
-        output_zip_path,
-        as_attachment=True,
-        download_name="bioprep_ht_results.zip",
-        mimetype="application/zip",
-    )
+        archive = shutil.make_archive(
+            os.path.join(workdir, 'bioprep_ht_results'), 'zip', output_dir)
+        return _send_and_cleanup(archive, workdir,
+                                 'bioprep_ht_results.zip', 'application/zip')
+    except Exception as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return _server_error('High-throughput processing failed', exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES: Templates
+# History
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/api/history', methods=['GET'])
+def list_history():
+    return jsonify(jobs_store.read())
+
+
+@app.route('/api/history/pdb/<uuid:job_id>', methods=['GET'])
+def get_history_pdb(job_id):
+    """
+    Serve a stored structure. The ``uuid`` converter constrains the id to a
+    real UUID, so it cannot be used to walk out of the results directory.
+    """
+    job_id = str(job_id)
+    path = sessions.get(job_id) or os.path.join(RESULTS_DIR, f'{job_id}.pdb')
+    if not os.path.isfile(path):
+        return _fail('That structure is no longer stored on this server.', 404)
+    return send_file(path, mimetype='chemical/x-pdb')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Templates
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/templates', methods=['GET'])
 def get_templates():
-    return jsonify(load_templates_store())
+    return jsonify(templates_store.read())
 
 
 @app.route('/api/templates', methods=['POST'])
 def save_template():
-    data = request.get_json()
-    if not data or 'name' not in data or 'settings' not in data:
-        return jsonify({'error': 'Need name and settings fields'}), 400
-    store = load_templates_store()
-    store[data['name']] = {
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name', '')).strip()
+    if not name or 'settings' not in data:
+        return _fail("Both 'name' and 'settings' are required.")
+
+    entry = {
         'settings': data['settings'],
         'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
     }
-    save_templates_store(store)
-    return jsonify({'success': True, 'templates': store})
+
+    def mutator(store):
+        store[name] = entry
+        return store
+
+    return jsonify({'success': True, 'templates': templates_store.update(mutator)})
 
 
 @app.route('/api/templates/<name>', methods=['DELETE'])
 def delete_template(name):
-    store = load_templates_store()
-    if name in store:
-        del store[name]
-        save_templates_store(store)
-    return jsonify({'success': True, 'templates': store})
+    def mutator(store):
+        store.pop(name, None)
+        return store
+
+    return jsonify({'success': True, 'templates': templates_store.update(mutator)})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES: Report download
+# Report download
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/download-report', methods=['POST'])
 def download_report():
-    """Accept a report JSON body and return a downloadable .txt file."""
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'No report data'}), 400
-    from bioprep.core.reporter import report_to_text
-    text = report_to_text(data)
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8')
-    tmp.write(text)
-    tmp.close()
-    return send_file(tmp.name, as_attachment=True, download_name='preparation_report.txt', mimetype='text/plain')
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _fail('Expected a JSON report object.')
 
+    # Small enough to build in memory, which avoids a temp file entirely.
+    payload = io.BytesIO(report_to_text(data).encode('utf-8'))
+    return send_file(payload, as_attachment=True,
+                     download_name='preparation_report.txt',
+                     mimetype='text/plain')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Binding site analysis
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/analyze-site', methods=['POST'])
-@app.route('/api/analyze-site/<session_id>', methods=['POST'])
+@app.route('/api/analyze-site/<uuid:session_id>', methods=['POST'])
 def analyze_binding_sites(session_id=None):
-    """Detect pockets and analyze binding sites."""
+    workdir = None
     try:
-        pdb_path = None
-        if 'file' in request.files:
-            file = request.files['file']
-            if file and file.filename.endswith('.pdb'):
-                temp_dir = tempfile.mkdtemp()
-                pdb_path = os.path.join(temp_dir, secure_filename(file.filename))
-                file.save(pdb_path)
-        elif session_id:
-            # Check if session_id exists in session_pdb_paths
-            session_data = session_pdb_paths.get(session_id)
-            if session_data:
-                pdb_path = session_data.get('current')
-            
-        if not pdb_path or not os.path.exists(pdb_path):
-            return jsonify({
-                'error': 'No structure found for analysis. Please upload a file or process a structure first.',
-                'code': 'NO_STRUCTURE'
-            }), 400
+        if 'file' in request.files and request.files['file'].filename:
+            upload, error = _require_pdb_upload()
+            if error:
+                return error
+            workdir = tempfile.mkdtemp(prefix='bioprep_site_')
+            pdb_path = os.path.join(workdir, secure_filename(upload.filename))
+            upload.save(pdb_path)
+        elif session_id is not None:
+            pdb_path = sessions.get(str(session_id)) or os.path.join(
+                RESULTS_DIR, f'{session_id}.pdb')
+        else:
+            return _fail('Upload a structure or supply a session id.',
+                         code='NO_STRUCTURE')
+
+        if not pdb_path or not os.path.isfile(pdb_path):
+            return _fail('No stored structure found for analysis. Process a '
+                         'structure first, or upload one directly.',
+                         code='NO_STRUCTURE')
 
         analyzer = BindingSiteAnalyzer(pdb_path)
         sites = analyzer.analyze()
-        summary = analyzer.get_summary(sites)
-        
         return jsonify({
             'success': True,
             'sites': sites,
-            'summary': summary,
-            'message': f"Found {len(sites)} potential binding sites"
+            'summary': analyzer.get_summary(sites),
+            'message': f'Found {len(sites)} candidate binding sites.',
         })
+    except Exception as exc:
+        return _server_error('Binding site analysis failed', exc)
+    finally:
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
 
-    except Exception as e:
-        app.logger.error(f"Site analysis failed: {str(e)}")
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+    _sweep_orphaned_workdirs()
+    # debug=False: the Werkzeug debugger executes arbitrary code from the browser.
+    app.run(host='127.0.0.1', port=5000, debug=False)

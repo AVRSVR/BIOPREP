@@ -30,13 +30,45 @@ not yet executed.
 | B9, B34 | `cli.py` rewritten: correct kwarg, repeatable `--chain`, plus `--remove-het`, `--protect`, `--minimize`, `--force-field`, `--no-gbsa`. | Full CLI run succeeds end to end |
 | — | New `core/residues.py` holds the shared classification tables (amino acids, nucleic acids, waters, ions). | — |
 
-### Round 2 — API layer (not started)
+### Round 2 — API layer (done, verified)
 
-Outstanding: B8, B15, B17–B23, B24, B25, B29–B33 in `app.py` and `reporter.py`.
+New `core/pipeline.py` holds the single clean → protonate → minimise → export
+sequence. Precision, batch and high-throughput all call it, which is what stops
+the modes drifting apart. `app.py` is now transport only.
+
+| ID | Fix | Verification |
+|---|---|---|
+| B8 | Failed docking export is recorded as `docking_export.succeeded = false` with the error, and no longer sets `docking_target`. | Report renders an export section with the failure |
+| B15 | Each request gets its own `tempfile.mkdtemp` working directory; no fixed filenames in the shared temp dir. | Concurrent requests cannot collide |
+| B17, B18 | Working directories are removed in `finally`, and archives are read into memory before the directory is deleted so nothing is left holding a file handle. A startup sweep clears anything orphaned by a crash. | 0 `bioprep_*` directories left after the full API suite |
+| B19 | `SessionStore` is a bounded LRU (200 entries) that deletes the stored file on eviction. | — |
+| B20 | High-throughput uses the shared pipeline, so chain selection, structural waters and docking export apply there too. | HT run honours `protect_ligands`; settings echoed into the log |
+| B21 | `heteroatoms.removed`/`retained` computed from what the selector actually did, including the `ALL` case. | `removed: ['SO4']`, `retained: ['BTN']` |
+| B22 | Waters retained by structural-water detection are subtracted from the removed count and reported separately. | — |
+| B23 | `atoms_before`/`after` documented as whole-structure counts; `delta` guaranteed `int`. | — |
+| B24, B25 | `report_to_text` uses defensive lookups throughout. | Partial and empty reports render instead of raising |
+| B29 | `JsonStore` guards history and templates with a lock and writes atomically via `os.replace`. | 25 concurrent template writes all landed; file still valid JSON |
+| B30 | The structure is base64-encoded once and reused when the download and viewer files are the same. | — |
+| B31 | `debug=False`, bound to `127.0.0.1`. | — |
+| B32 | Exceptions are logged server-side; clients get a generic message. | — |
+| B33 | ZIP extraction capped at 500 members and 2 GB expanded. | — |
+| B32 (path) | History and site routes use Flask's `uuid` converter, so a non-UUID id cannot reach the filesystem. | `..%2f..%2fapp` → 404; valid UUID → 200 |
+| B35, B36 | Dead code removed: `allowed_file`, `ALLOWED_EXTENSIONS`, `batch_progress`, and the unused `queue`/`threading`/`Response`/`stream_with_context` imports. | — |
+| B40 | `numpy` added to `install_requires`; `python_requires` declared. | — |
+| B41, B43 | Stale UTF-16 captures and the ad-hoc scripts deleted; coverage moved into `tests/`. | — |
+
+Regression suite added at `tests/test_backend.py` (16 tests) with `tests/conftest.py`
+fixing the namespace-package shadowing that made `bioprep.core` unimportable from
+the repository root.
+
+```bash
+cd tests && python -m unittest test_backend -v
+```
 
 ### Round 3 — analysis accuracy (not started)
 
-Outstanding: B10–B14 in `analyzer.py` and `site_analyzer.py`, plus B26, B27 in `exporter.py`.
+Outstanding: B10–B14 in `analyzer.py` and `site_analyzer.py`, plus B26, B27 in
+`exporter.py`, B28 verification, and B34/B42.
 
 ---
 
