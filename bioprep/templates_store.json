@@ -1,0 +1,15 @@
+{
+  "10 e": {
+    "settings": {
+      "ph": 7.4,
+      "remove_water": true,
+      "keep_structural_waters": true,
+      "add_missing_atoms": true,
+      "reconstruct_loops": true,
+      "run_minimization": true,
+      "force_field": "amber14",
+      "docking_target": "vina"
+    },
+    "created_at": "2026-03-15 17:46 UTC"
+  }
+}

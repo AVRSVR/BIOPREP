@@ -1,0 +1,7 @@
+biopython>=1.80
+pdbfixer>=1.9
+openmm>=8.0
+flask
+werkzeug
+scipy
+scikit-learn

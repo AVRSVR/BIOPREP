@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# runtime state, not source
+bioprep/processed_data/
+bioprep/jobs_history.json
+bioprep/tmp/
+tmp_test_hets/
+
+# stale PowerShell capture files from old runs
+bioprep/error.txt
+bioprep/test_out.txt
