@@ -6,12 +6,15 @@ class BioPrepSelect(Select):
     Biopython Select class to optionally filter out water, specific heteroatoms,
     and restrict to specific chains without altering the base coordinate geometry.
     """
-    def __init__(self, target_chains=None, remove_water=True, remove_heteroatoms=None, keep_structural_waters=False, structural_waters=None):
+    def __init__(self, target_chains=None, remove_water=True, remove_heteroatoms=None,
+                 keep_structural_waters=False, structural_waters=None, protect_ligands=None):
         self.target_chains = target_chains if target_chains else []
         self.remove_water = remove_water
         self.remove_heteroatoms = remove_heteroatoms if remove_heteroatoms else []
         self.keep_structural_waters = keep_structural_waters
+        # Keys are (chain_id, residue.id) — residue ids repeat across chains.
         self.structural_waters = structural_waters if structural_waters else set()
+        self.protect_ligands = protect_ligands if protect_ligands else []
 
     def accept_chain(self, chain):
         if self.target_chains and chain.id not in self.target_chains:
@@ -20,27 +23,34 @@ class BioPrepSelect(Select):
 
     def accept_residue(self, residue):
         hetfield = residue.id[0]
+        chain_id = residue.get_parent().id
 
         # 1. Handle Water
         if hetfield == 'W':
-            if self.keep_structural_waters and residue.id in self.structural_waters:
+            if self.keep_structural_waters and (chain_id, residue.id) in self.structural_waters:
                 return 1
             return 0 if self.remove_water else 1
 
         # 2. Handle Heteroatoms (Ligands, ions, lipids, etc.)
-        # Biopython heteroatoms have id[0] NOT starting with a space ' ' 
+        # Biopython heteroatoms have id[0] NOT starting with a space ' '
         # (Standard residues are ' ', waters are 'W', heteroatoms are 'H_xxx')
         if hetfield != ' ':
             res_name = residue.resname.strip()
-            
+
+            # An explicitly protected ligand outranks every removal rule,
+            # including 'ALL'. Without this, "remove all heteroatoms" silently
+            # deleted ligands the user had asked to keep.
+            if res_name in self.protect_ligands:
+                return 1
+
             # If user selected "Remove ALL Heteros"
             if 'ALL' in self.remove_heteroatoms:
                 return 0
-                
+
             # If THIS specific residue name is in the removal list, remove it
             if res_name in self.remove_heteroatoms:
                 return 0
-            
+
             # OTHERWISE: Keep it (Surgical preservation)
             return 1
 
@@ -48,7 +58,8 @@ class BioPrepSelect(Select):
         return 1
 
 
-def clean_structure(structure, target_chains=None, remove_water=True, remove_heteroatoms=None, keep_structural_waters=False):
+def clean_structure(structure, target_chains=None, remove_water=True, remove_heteroatoms=None,
+                    keep_structural_waters=False, protect_ligands=None):
     """
     Returns a configured Biopython Select object that filters unwanted
     residues, water molecules, and restricts to targeted chains.
@@ -74,19 +85,21 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
                         # Standard amino acid — add all atoms to reference
                         protein_atoms.extend(residue.get_atoms())
                     elif hetfield == 'W':
-                        water_residues.append(residue)
+                        water_residues.append((chain.id, residue))
 
-        # FIX: Build NeighborSearch from protein atoms (the reference),
-        # then query each water's oxygen to see if it's close to ANY protein atom.
+        # Build NeighborSearch from protein atoms (the reference), then query
+        # each water's oxygen to see if it's close to ANY protein atom.
         if protein_atoms and water_residues:
             ns = NeighborSearch(protein_atoms)
-            for water_res in water_residues:
+            for chain_id, water_res in water_residues:
                 for w_atom in water_res.get_atoms():
                     # Standard water oxygen is usually 'O' or 'OW'
                     if w_atom.get_name() in ('O', 'OW', 'O1'):
                         nearby_protein_atoms = ns.search(w_atom.get_coord(), 4.0)
                         if nearby_protein_atoms:
-                            structural_waters.add(water_res.id)
+                            # Qualify by chain: residue ids repeat across chains,
+                            # so a bare id would keep unrelated waters elsewhere.
+                            structural_waters.add((chain_id, water_res.id))
                             break  # Only need one hit per water molecule
 
     return BioPrepSelect(
@@ -94,5 +107,6 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
         remove_water=remove_water,
         remove_heteroatoms=remove_heteroatoms,
         keep_structural_waters=keep_structural_waters,
-        structural_waters=structural_waters
+        structural_waters=structural_waters,
+        protect_ligands=protect_ligands,
     )

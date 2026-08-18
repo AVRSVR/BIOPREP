@@ -1,109 +1,249 @@
-import os
-import time
+"""
+Energy minimisation with a graded fallback.
+
+Real PDB entries routinely contain residues no protein force field can
+parameterise — novel ligands, unusual cofactors, modified bases. A single
+`createSystem` call fails on those, so this module degrades in stages:
+
+  Tier 1  minimise everything as-is
+  Tier 2  minimise only force-field-safe residues, then splice the moved
+          coordinates back into the full structure by atom identity
+  Tier 3  Tier 2 again with implicit solvent switched off
+
+If every tier fails the input is passed through unchanged and ``status`` says
+so. Callers must check ``status`` — a returned file is not proof of work.
+"""
+
 import logging
-import traceback
 import math
+import shutil
+
 import openmm as mm
 from openmm import app
 from openmm import unit
 
+from .residues import is_force_field_safe
+
 logger = logging.getLogger(__name__)
 
-def minimize_structure(input_pdb_path, output_pdb_path, force_field="amber14", use_gbsa=True):
+MAX_ITERATIONS = 1000
+ENERGY_TOLERANCE = 10.0          # kJ/mol/nm
+SUSPECT_ENERGY = 1.0e12          # kJ/mol — beyond this, geometry is suspect
+
+STATUS_FULL = 'full'
+STATUS_PARTIAL = 'partial'
+STATUS_PARTIAL_NO_GBSA = 'partial_no_implicit_solvent'
+STATUS_FAILED = 'failed'
+
+
+def _build_forcefield(force_field, use_gbsa):
     """
-    Minimizes the energy of a protein structure using OpenMM.
-    If minimization fails, the input file is copied to the output path
-    and an error message is returned.
+    Assemble a ForceField. Water parameters are always included — omitting
+    them is what made retained crystallographic waters abort minimisation.
     """
+    if force_field == 'charmm36':
+        return app.ForceField('charmm36.xml', 'charmm36/water.xml')
+
+    if use_gbsa:
+        # tip3pfb supplies the water templates that implicit/obc2 lacks.
+        return app.ForceField(
+            'amber14-all.xml', 'implicit/obc2.xml', 'amber14/tip3pfb.xml'
+        )
+    return app.ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
+
+
+def _atom_key(atom):
+    """Identity of an atom that survives topology rebuilds."""
+    residue = atom.residue
+    return (residue.chain.id, residue.name, residue.id, atom.name)
+
+
+def _run(topology, positions, forcefield):
+    """Minimise one system. Returns (positions, energy_before, energy_after)."""
+    system = forcefield.createSystem(
+        topology, nonbondedMethod=app.NoCutoff, constraints=app.HBonds
+    )
+    integrator = mm.LangevinMiddleIntegrator(
+        300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picosecond
+    )
+    simulation = app.Simulation(topology, system, integrator)
+    simulation.context.setPositions(positions)
+
+    before = (simulation.context.getState(getEnergy=True)
+              .getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole))
+    if math.isnan(before) or math.isinf(before):
+        raise ValueError(
+            f"Initial potential energy is {before}. The structure has severe "
+            "atomic clashes or overlapping atoms; minimisation cannot start."
+        )
+
+    simulation.minimizeEnergy(
+        maxIterations=MAX_ITERATIONS, tolerance=ENERGY_TOLERANCE
+    )
+
+    state = simulation.context.getState(getEnergy=True, getPositions=True)
+    after = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+    if math.isnan(after) or math.isinf(after):
+        raise ValueError(
+            f"Minimisation produced a non-finite energy ({after}); the result "
+            "is unusable."
+        )
+    return state.getPositions(), before, after
+
+
+def _safe_subset(pdb):
+    """
+    Build a topology containing only force-field-safe residues.
+
+    Returns (modeller, excluded_resnames) or (None, ...) if nothing was
+    excluded — in which case Tier 2 would be identical to Tier 1.
+    """
+    excluded = sorted({
+        residue.name for residue in pdb.topology.residues()
+        if not is_force_field_safe(residue.name)
+    })
+    if not excluded:
+        return None, excluded
+
+    modeller = app.Modeller(pdb.topology, pdb.positions)
+    doomed = [
+        residue for residue in modeller.topology.residues()
+        if not is_force_field_safe(residue.name)
+    ]
+    modeller.delete(doomed)
+    return modeller, excluded
+
+
+def _merge_coords_by_name(pdb, minimised_topology, minimised_positions):
+    """
+    Write minimised coordinates back into the full structure.
+
+    Matching is by (chain, residue name, residue id, atom name) rather than
+    by index: the minimised subset has a different atom count, so positional
+    mapping would silently scramble the coordinates.
+
+    Units are stripped to plain Vec3 in nanometres first — mixing bare Vec3
+    with unit-carrying Quantity objects in one list produces a sequence that
+    OpenMM's PDB writer cannot consume.
+    """
+    minimised = minimised_positions.value_in_unit(unit.nanometer)
+    moved = {
+        _atom_key(atom): minimised[i]
+        for i, atom in enumerate(minimised_topology.atoms())
+    }
+
+    merged = list(pdb.positions.value_in_unit(unit.nanometer))
+    for i, atom in enumerate(pdb.topology.atoms()):
+        new_position = moved.get(_atom_key(atom))
+        if new_position is not None:
+            merged[i] = new_position
+    return unit.Quantity(merged, unit.nanometer)
+
+
+def _write(path, topology, positions):
+    with open(path, 'w') as fh:
+        app.PDBFile.writeFile(topology, positions, fh, keepIds=True)
+
+
+def minimize_structure(input_pdb_path, output_pdb_path,
+                       force_field='amber14', use_gbsa=True):
+    """
+    Minimise a structure, degrading gracefully.
+
+    Always returns a dict containing ``status`` (one of ``full``, ``partial``,
+    ``partial_no_implicit_solvent``, ``failed``). Energies are ``None`` when no
+    minimisation ran — never the string ``'N/A'``, which is not a number and
+    forces callers to type-check.
+    """
+    result = {
+        'force_field': force_field,
+        'gbsa_used': use_gbsa,
+        'status': STATUS_FAILED,
+        'energy_before_kJ_mol': None,
+        'energy_after_kJ_mol': None,
+        'delta_energy_kJ_mol': None,
+        'iterations_max': MAX_ITERATIONS,
+        'energy_decreased': False,
+        'excluded_residues': [],
+        'warnings': [],
+        'error': None,
+        'output_path': output_pdb_path,
+    }
+
     try:
         pdb = app.PDBFile(input_pdb_path)
-        
-        # 1. Select Force Field
-        ff = None
-        if force_field == "amber14":
-            if use_gbsa:
-                # Use AMBER14 with OBC2 implicit solvent
-                ff = app.ForceField('amber14-all.xml', 'implicit/obc2.xml')
-            else:
-                ff = app.ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
-        elif force_field == "charmm36":
-            # CHARMM36 typically needs its own specific water/implicit models
-            # but we fall back to standard if implicit isn't available
-            if use_gbsa:
-                try:
-                    ff = app.ForceField('charmm36.xml', 'charmm36/water.xml') # GBSA not natively standard for charmm36 in openmm without explicit params, simplified here
-                except Exception:
-                    logger.warning("CHARMM36 GBSA not found, falling back to AMBER14 GBSA")
-                    ff = app.ForceField('amber14-all.xml', 'implicit/obc2.xml')
-            else:
-                ff = app.ForceField('charmm36.xml', 'charmm36/water.xml')
-        else:
-            ff = app.ForceField('amber14-all.xml', 'amber14/tip3pfb.xml')
-            
-        # 2. Setup System
-        if pdb.topology.getNumAtoms() == 0:
-            raise ValueError("The structure contains no atoms (possibly all chains were removed). Minimization skipped.")
-            
-        kwargs = {"nonbondedMethod": app.NoCutoff, "constraints": app.HBonds}
-        system = ff.createSystem(pdb.topology, **kwargs)
-        
-        # 3. Setup Simulation
-        integrator = mm.LangevinMiddleIntegrator(
-            300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picosecond
-        )
-        simulation = app.Simulation(pdb.topology, system, integrator)
-        simulation.context.setPositions(pdb.positions)
-        
-        # Check initial energy
-        state_before = simulation.context.getState(getEnergy=True)
-        energy_before = state_before.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        
-        # Guard against NaN/Inf
-        if math.isnan(energy_before) or math.isinf(energy_before):
-            raise ValueError(f"Extremely high initial energy ({energy_before}). Severe atomic clashes prevent minimization.")
-        
-        # 4. Minimize
-        simulation.minimizeEnergy(maxIterations=1000)
-        
-        # Check final energy
-        state_after = simulation.context.getState(getEnergy=True, getPositions=True)
-        energy_after = state_after.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        
-        # 5. Save output
-        with open(output_pdb_path, "w") as f:
-            app.PDBFile.writeFile(
-                simulation.topology, state_after.getPositions(), f, keepIds=True
-            )
-            
-        delta_energy = energy_after - energy_before
-        converged = (delta_energy < -0.1)
-        
-        return {
-            "force_field": force_field,
-            "energy_before_kJ_mol": round(energy_before, 1),
-            "energy_after_kJ_mol": round(energy_after, 1),
-            "delta_energy_kJ_mol": round(delta_energy, 1),
-            "iterations": 1000,
-            "converged": converged,
-            "gbsa_used": use_gbsa,
-            "output_path": output_pdb_path,
-        }
-        
-    except Exception as e:
-        logger.error(f"Energy minimization failed: {e}")
-        import shutil
+    except Exception as exc:
+        result['error'] = f"Could not read PDB: {exc}"
         shutil.copy2(input_pdb_path, output_pdb_path)
-        
-        # Fallback dictionary. The frontend now knows to look for "error"
-        # and display it nicely instead of "N/A"
-        return {
-            "force_field": force_field,
-            "energy_before_kJ_mol": "N/A",
-            "energy_after_kJ_mol": "N/A",
-            "delta_energy_kJ_mol": "N/A",
-            "iterations": 0,
-            "converged": False,
-            "gbsa_used": use_gbsa,
-            "error": str(e),
-            "output_path": output_pdb_path,
-        }
+        return result
+
+    if pdb.topology.getNumAtoms() == 0:
+        result['error'] = (
+            "The structure contains no atoms — every chain may have been "
+            "filtered out during cleaning."
+        )
+        shutil.copy2(input_pdb_path, output_pdb_path)
+        return result
+
+    attempts = [
+        (STATUS_FULL, use_gbsa, False),
+        (STATUS_PARTIAL, use_gbsa, True),
+    ]
+    if use_gbsa:
+        attempts.append((STATUS_PARTIAL_NO_GBSA, False, True))
+
+    errors = []
+    for status, gbsa, restrict in attempts:
+        try:
+            forcefield = _build_forcefield(force_field, gbsa)
+
+            if restrict:
+                modeller, excluded = _safe_subset(pdb)
+                if modeller is None:
+                    # Nothing to strip, so this tier cannot differ from Tier 1.
+                    continue
+                positions, before, after = _run(
+                    modeller.topology, modeller.positions, forcefield
+                )
+                merged = _merge_coords_by_name(pdb, modeller.topology, positions)
+                _write(output_pdb_path, pdb.topology, merged)
+                result['excluded_residues'] = excluded
+                result['warnings'].append(
+                    "Minimised only force-field-parameterisable residues. "
+                    "These were held at their input coordinates: "
+                    + ', '.join(excluded)
+                )
+            else:
+                positions, before, after = _run(
+                    pdb.topology, pdb.positions, forcefield
+                )
+                _write(output_pdb_path, pdb.topology, positions)
+
+            if abs(before) > SUSPECT_ENERGY:
+                result['warnings'].append(
+                    f"Starting energy was {before:.3e} kJ/mol, which indicates "
+                    "severe steric clashes in the input. Treat the minimised "
+                    "geometry with caution."
+                )
+
+            result.update({
+                'status': status,
+                'gbsa_used': gbsa,
+                'energy_before_kJ_mol': round(before, 1),
+                'energy_after_kJ_mol': round(after, 1),
+                'delta_energy_kJ_mol': round(after - before, 1),
+                'energy_decreased': (after - before) < -0.1,
+            })
+            return result
+
+        except Exception as exc:
+            errors.append(f"[{status}] {exc}")
+            logger.warning("Minimisation tier %s failed: %s", status, exc)
+
+    # Every tier failed — pass the input through, but say so plainly.
+    shutil.copy2(input_pdb_path, output_pdb_path)
+    result['error'] = (
+        "Minimisation could not be performed; the structure was passed through "
+        "unchanged. Attempts: " + ' | '.join(errors)
+    )
+    return result

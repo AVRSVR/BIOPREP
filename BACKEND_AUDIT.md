@@ -11,6 +11,35 @@ not yet executed.
 
 ---
 
+## Progress
+
+### Round 1 — core scientific layer (done, verified)
+
+| ID | Fix | Verification |
+|---|---|---|
+| A9, A10, A11 | `protonator.py` rewritten. Ligand HETATM records are split out before PDBFixer runs and spliced back with original coordinates, renumbered serials and remapped `CONECT` records. Returns a status dict instead of `None`. | BTN survives protonation with byte-identical coordinates |
+| A21, A22, A24, A25, A30, B1 | `minimizer.py` rewritten with the three-tier fallback. Tier 2 strips non-parameterisable residues via `Modeller`, minimises the rest, and merges coordinates back by `(chain, resname, resid, atomname)`. | Ligand structure: `status=partial`, 978.1 → −5155.8 kJ/mol, protein moved, BTN frozen |
+| B2 | GBSA force field now also loads `amber14/tip3pfb.xml`, so retained waters no longer abort minimisation. | Water + GBSA: `status=full`, minimised (was: hard failure) |
+| B3 | `minimize_structure` always returns `status` (`full`/`partial`/`partial_no_implicit_solvent`/`failed`). A copied-through file is never reported as minimised. | Failure path returns `status=failed` with populated `error` |
+| B4 | Starting energies above 1e12 kJ/mol attach a clash warning rather than being silently accepted. | 1.045e13 start now emits the warning |
+| B5 | `protect_ligands` is now honoured inside `BioPrepSelect` and outranks `'ALL'`. | Protected BTN survives `remove ALL`; unprotected SO4 removed |
+| B6 | Structural waters keyed by `(chain_id, residue.id)`. | Chain-B water 500 Å away no longer preserved |
+| B7 | `add_hydrogens` reports `hydrogens_added` truthfully plus a `warnings` list. | Returns `{'hydrogens_added': True, 'ligands_preserved': [...]}` |
+| B16 | Energies are `float` or `None`, never the string `'N/A'`. | `json.dumps(..., allow_nan=False)` succeeds |
+| B28 | Ligand `CONECT` records preserved and remapped through the pipeline. | — |
+| B9, B34 | `cli.py` rewritten: correct kwarg, repeatable `--chain`, plus `--remove-het`, `--protect`, `--minimize`, `--force-field`, `--no-gbsa`. | Full CLI run succeeds end to end |
+| — | New `core/residues.py` holds the shared classification tables (amino acids, nucleic acids, waters, ions). | — |
+
+### Round 2 — API layer (not started)
+
+Outstanding: B8, B15, B17–B23, B24, B25, B29–B33 in `app.py` and `reporter.py`.
+
+### Round 3 — analysis accuracy (not started)
+
+Outstanding: B10–B14 in `analyzer.py` and `site_analyzer.py`, plus B26, B27 in `exporter.py`.
+
+---
+
 ## Table A — Documented features vs. reality
 
 Claims from `bioprep_deep_dive.md` / `bioprep_technical_pitch.md`.
