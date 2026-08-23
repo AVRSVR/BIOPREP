@@ -323,6 +323,21 @@ class BindingSiteAnalyzer:
             'pharmacophore_points': pharmacophores,
             'drugability_score': round(drugability, 2),
             'concavity': round(concavity_score, 2),
+            # The five weighted factors, exposed so a ranking can be argued
+            # with rather than taken on faith. This is an unvalidated
+            # heuristic: on HIV-1 protease (1HSG) the real inhibitor site is
+            # found but ranks last of five, because it is larger than the
+            # 300-1000 A^3 band the volume term rewards.
+            'drugability_factors': {
+                'volume': {'score': round(volume_score, 3), 'weight': 0.30},
+                'property_diversity': {'score': round(prop_diversity, 3),
+                                       'weight': 0.20},
+                'hydrophobic_balance': {'score': round(balance_score, 3),
+                                        'weight': 0.20},
+                'concavity': {'score': round(concavity_score, 3), 'weight': 0.20},
+                'pharmacophore_density': {'score': round(pharm_score, 3),
+                                          'weight': 0.10},
+            },
         }
 
     def _predict_pharmacophores(self, nearby_atoms, centroid) -> List[Dict[str, Any]]:

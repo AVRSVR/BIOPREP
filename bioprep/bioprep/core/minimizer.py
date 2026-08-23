@@ -18,6 +18,7 @@ import logging
 import math
 import shutil
 
+import numpy as np
 import openmm as mm
 from openmm import app
 from openmm import unit
@@ -29,6 +30,12 @@ logger = logging.getLogger(__name__)
 MAX_ITERATIONS = 1000
 ENERGY_TOLERANCE = 10.0          # kJ/mol/nm
 SUSPECT_ENERGY = 1.0e12          # kJ/mol — beyond this, geometry is suspect
+
+# Tier 2 deletes the residues no force field can parameterise, which leaves the
+# site they occupied empty. These hold the surrounding atoms near their input
+# positions so the site cannot relax inward while its occupant is missing.
+POCKET_RESTRAINT_CUTOFF = 5.0    # angstrom around a deleted residue
+POCKET_RESTRAINT_K = 500.0       # kJ/mol/nm^2 applied to those atoms
 
 STATUS_FULL = 'full'
 STATUS_PARTIAL = 'partial'
@@ -102,7 +109,30 @@ def _create_system(topology, positions, forcefield, allow_terminal_fix=True):
         return system, modeller.topology, modeller.positions, True
 
 
-def _run(topology, positions, forcefield):
+def _add_position_restraints(system, positions, indices):
+    """
+    Pin the given atoms near their input coordinates with a harmonic well.
+
+    Used to hold a pocket open while the residue that filled it is absent.
+    """
+    if not indices:
+        return
+    restraint = mm.CustomExternalForce(
+        '0.5*k_pocket*((x-x0)^2 + (y-y0)^2 + (z-z0)^2)')
+    restraint.addGlobalParameter(
+        'k_pocket',
+        POCKET_RESTRAINT_K * unit.kilojoule_per_mole / unit.nanometer ** 2)
+    for name in ('x0', 'y0', 'z0'):
+        restraint.addPerParticleParameter(name)
+
+    reference = positions.value_in_unit(unit.nanometer)
+    for index in indices:
+        x, y, z = reference[index]
+        restraint.addParticle(int(index), [x, y, z])
+    system.addForce(restraint)
+
+
+def _run(topology, positions, forcefield, restrain_indices=()):
     """
     Minimise one system.
 
@@ -111,6 +141,10 @@ def _run(topology, positions, forcefield):
     """
     system, topology, positions, repaired = _create_system(
         topology, positions, forcefield)
+
+    # Only safe when the topology was not rebuilt; a repair renumbers atoms.
+    if restrain_indices and not repaired:
+        _add_position_restraints(system, positions, restrain_indices)
 
     integrator = mm.LangevinMiddleIntegrator(
         300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picosecond
@@ -144,15 +178,31 @@ def _safe_subset(pdb):
     """
     Build a topology containing only force-field-safe residues.
 
-    Returns (modeller, excluded_resnames) or (None, ...) if nothing was
-    excluded — in which case Tier 2 would be identical to Tier 1.
+    Also works out which surviving atoms line the space the deleted residues
+    occupied. Those atoms are restrained during the tier-2 minimisation:
+    without the ligand present there is nothing holding the pocket open, so
+    the walls relax inward and the structure that comes back - ligand restored
+    at its crystallographic position - contains contacts that were never in
+    the input. Measured on streptavidin, 22 of 67 pocket-lining atoms moved
+    toward biotin and the closest contact tightened from 2.58 to 2.33 A.
+
+    Returns (modeller, excluded_resnames, lining_atom_indices), or
+    (None, [], []) when nothing was excluded and tier 2 would just repeat
+    tier 1.
     """
     excluded = sorted({
         residue.name for residue in pdb.topology.residues()
         if not is_force_field_safe(residue.name)
     })
     if not excluded:
-        return None, excluded
+        return None, excluded, []
+
+    positions = np.array(pdb.positions.value_in_unit(unit.nanometer))
+
+    doomed_indices = []
+    for residue in pdb.topology.residues():
+        if not is_force_field_safe(residue.name):
+            doomed_indices.extend(atom.index for atom in residue.atoms())
 
     modeller = app.Modeller(pdb.topology, pdb.positions)
     doomed = [
@@ -160,7 +210,22 @@ def _safe_subset(pdb):
         if not is_force_field_safe(residue.name)
     ]
     modeller.delete(doomed)
-    return modeller, excluded
+
+    # Surviving atoms are in the same order as the original, minus the deleted
+    # ones, so the mapping can be rebuilt by walking the kept indices.
+    doomed_set = set(doomed_indices)
+    kept_indices = [i for i in range(len(positions)) if i not in doomed_set]
+
+    lining = []
+    if doomed_indices:
+        doomed_xyz = positions[doomed_indices]
+        kept_xyz = positions[kept_indices]
+        cutoff_nm = POCKET_RESTRAINT_CUTOFF / 10.0
+        distances = np.linalg.norm(
+            kept_xyz[:, None, :] - doomed_xyz[None, :, :], axis=2).min(axis=1)
+        lining = [new for new, d in enumerate(distances) if d <= cutoff_nm]
+
+    return modeller, excluded, lining
 
 
 def _merge_coords_by_name(pdb, minimised_topology, minimised_positions):
@@ -216,6 +281,7 @@ def minimize_structure(input_pdb_path, output_pdb_path,
         'energy_decreased': False,
         'converged': False,
         'terminals_repaired': False,
+        'restrained_atoms': 0,
         'excluded_residues': [],
         'warnings': [],
         'error': None,
@@ -250,13 +316,15 @@ def minimize_structure(input_pdb_path, output_pdb_path,
             forcefield = _build_forcefield(force_field, gbsa)
 
             if restrict:
-                modeller, excluded = _safe_subset(pdb)
+                modeller, excluded, lining = _safe_subset(pdb)
                 if modeller is None:
                     # Nothing to strip, so this tier cannot differ from Tier 1.
                     continue
                 positions, before, after, sub_topology, repaired = _run(
-                    modeller.topology, modeller.positions, forcefield
+                    modeller.topology, modeller.positions, forcefield,
+                    restrain_indices=lining
                 )
+                result['restrained_atoms'] = len(lining) if not repaired else 0
                 merged = _merge_coords_by_name(pdb, sub_topology, positions)
                 _write(output_pdb_path, pdb.topology, merged)
                 result['excluded_residues'] = excluded
@@ -264,6 +332,9 @@ def minimize_structure(input_pdb_path, output_pdb_path,
                     "Minimised only force-field-parameterisable residues. "
                     "These were held at their input coordinates: "
                     + ', '.join(excluded)
+                    + f". {len(lining)} atoms lining them were harmonically "
+                      "restrained so the site could not relax inward while "
+                      "they were absent."
                 )
             else:
                 positions, before, after, topology, repaired = _run(

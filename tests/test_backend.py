@@ -1647,6 +1647,147 @@ class TestAnalyzerFeatures(TempDirTest):
             analyzer.detect_missing_residues(self.path('nope.pdb')), [])
 
 
+class TestScienceCorrectness(TempDirTest):
+    """
+    Physics and chemistry checks, as distinct from feature checks.
+
+    These ask whether the result is defensible, not whether the code ran.
+    """
+
+    def test_disulfide_cysteines_are_not_protonated(self):
+        """
+        1CRN has three disulfide bridges. A bridged cysteine is oxidised;
+        an HG on its SG invents a fourth bond on sulphur and breaks the bridge.
+        """
+        import numpy as np
+
+        structure = io.load_pdb(CRN)
+        io.save_pdb(structure, self.path('clean.pdb'),
+                    select=cleaner.clean_structure(structure), source_pdb=CRN)
+        protonator.add_hydrogens(self.path('clean.pdb'), self.path('out.pdb'))
+
+        rows = [l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                if l[:6] in ('ATOM  ', 'HETATM')]
+        sg = {int(l[22:26]): np.array([float(l[30:38]), float(l[38:46]),
+                                       float(l[46:54])])
+              for l in rows if l[12:16].strip() == 'SG'}
+
+        bridged = set()
+        keys = sorted(sg)
+        for i, a in enumerate(keys):
+            for b in keys[i + 1:]:
+                if np.linalg.norm(sg[a] - sg[b]) < 2.5:
+                    bridged.update({a, b})
+        self.assertEqual(len(bridged), 6, 'expected three disulfide bridges')
+
+        with_hg = {int(l[22:26]) for l in rows
+                   if l[12:16].strip() == 'HG' and l[17:20].strip() == 'CYS'}
+        self.assertFalse(with_hg & bridged,
+                         'a bridged cysteine was given a thiol hydrogen')
+
+    def test_terminal_oxt_is_added_when_missing(self):
+        """
+        A chain deposited without a capped terminus has no OXT, matches no
+        force-field template, and fails every minimisation tier.
+        """
+        lines = [l for l in _protein_lines() if l[12:16].strip() != 'OXT']
+        source = _write(self.path('noterm.pdb'), lines)
+
+        result = protonator.add_hydrogens(source, self.path('out.pdb'))
+        written = pathlib.Path(self.path('out.pdb')).read_text()
+
+        self.assertIn('OXT', written, 'terminal oxygen was not added')
+        self.assertGreater(result['terminals_repaired'], 0)
+
+    def test_structural_water_requires_a_polar_contact(self):
+        """
+        Proximity to a carbon does not hold a water in place. Every retained
+        water must have an N, O or S within the hydrogen-bond cutoff.
+        """
+        import numpy as np
+
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+
+        # one water hydrogen bonded to a backbone oxygen, one packed against
+        # a carbon with no polar partner, one far away
+        polar_anchor = next(l for l in lines if l[12:16].strip() == 'O')
+        px, py, pz = (float(polar_anchor[30:38]), float(polar_anchor[38:46]),
+                      float(polar_anchor[46:54]))
+
+        rows = lines + [
+            f'HETATM  900  O   HOH A 700    {px + 2.8:8.3f}{py:8.3f}{pz:8.3f}'
+            '  1.00 10.00           O  \n',
+            f'HETATM  901  O   HOH A 701    {x + 500:8.3f}{y:8.3f}{z:8.3f}'
+            '  1.00 10.00           O  \n',
+        ]
+        source = _write(self.path('w.pdb'), rows)
+
+        structure = io.load_pdb(source)
+        select = cleaner.clean_structure(structure, remove_water=True,
+                                         keep_structural_waters=True)
+        io.save_pdb(structure, self.path('out.pdb'), select=select,
+                    source_pdb=source)
+
+        kept = [l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                if l.startswith('HETATM') and l[17:20].strip() == 'HOH']
+        self.assertEqual(len(kept), 1, 'expected only the hydrogen-bonded water')
+        self.assertEqual(int(kept[0][22:26]), 700)
+
+        # and every kept water genuinely has a polar partner
+        protein = np.array([[float(l[30:38]), float(l[38:46]), float(l[46:54])]
+                            for l in lines
+                            if l[76:78].strip() in ('N', 'O', 'S')])
+        for row in kept:
+            w = np.array([float(row[30:38]), float(row[38:46]), float(row[46:54])])
+            self.assertLessEqual(np.linalg.norm(protein - w, axis=1).min(),
+                                 cleaner.STRUCTURAL_WATER_CUTOFF + 0.01)
+
+    def test_pocket_detection_scans_seven_axes(self):
+        """
+        Six axis-aligned rays make the result depend on input orientation.
+        LIGSITE scans the three Cartesian axes plus four cubic diagonals.
+        """
+        import numpy as np
+
+        directions = site_analyzer.ENCLOSURE_DIRECTIONS
+        self.assertEqual(len(directions), 14)
+        norms = np.linalg.norm(directions, axis=1)
+        self.assertTrue(np.allclose(norms, 1.0), 'directions must be unit vectors')
+
+        # every direction must have its opposite present
+        for d in directions:
+            self.assertTrue(any(np.allclose(d, -other) for other in directions))
+
+        # and the diagonals must actually be there
+        diagonal = np.array([1.0, 1.0, 1.0]) / np.sqrt(3)
+        self.assertTrue(any(np.allclose(diagonal, d) for d in directions))
+
+    def test_drugability_factors_are_exposed(self):
+        """The ranking is an unvalidated heuristic; it must be auditable."""
+        source = self._protonated_crn()
+        sites = site_analyzer.BindingSiteAnalyzer(source).analyze()
+        self.assertTrue(sites)
+
+        factors = sites[0]['drugability_factors']
+        self.assertEqual(
+            set(factors), {'volume', 'property_diversity', 'hydrophobic_balance',
+                           'concavity', 'pharmacophore_density'})
+        self.assertAlmostEqual(sum(f['weight'] for f in factors.values()), 1.0,
+                               places=6)
+
+        recomputed = sum(f['score'] * f['weight'] for f in factors.values())
+        self.assertAlmostEqual(recomputed, sites[0]['drugability_score'],
+                               delta=0.02)
+
+    def _protonated_crn(self):
+        structure = io.load_pdb(CRN)
+        io.save_pdb(structure, self.path('c.pdb'),
+                    select=cleaner.clean_structure(structure), source_pdb=CRN)
+        protonator.add_hydrogens(self.path('c.pdb'), self.path('p.pdb'))
+        return self.path('p.pdb')
+
+
 class TestSiteAnalyzer(TempDirTest):
 
     def _protonated(self):

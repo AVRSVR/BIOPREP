@@ -3,6 +3,24 @@ from Bio.PDB import Select, NeighborSearch
 from .residues import is_water
 
 
+#: A water is kept as "structural" when its oxygen sits this close to a protein
+#: atom that can actually hydrogen bond to it. The earlier rule was 4.0 A to
+#: ANY protein atom, carbon included, which keeps water packed against a
+#: hydrophobic surface with nothing holding it there. On streptavidin that was
+#: 8 of 78 retained waters. 3.5 A is the usual upper bound for an O/N-H...O
+#: hydrogen bond between heavy atoms.
+STRUCTURAL_WATER_CUTOFF = 3.5
+HBOND_CAPABLE_ELEMENTS = {'N', 'O', 'S'}
+
+
+def _can_hydrogen_bond(atom):
+    """True for protein atoms able to donate or accept a hydrogen bond."""
+    element = (atom.element or '').strip().upper()
+    if element:
+        return element in HBOND_CAPABLE_ELEMENTS
+    return atom.get_name().strip().upper()[:1] in HBOND_CAPABLE_ELEMENTS
+
+
 def _normalise_names(names):
     """Upper-case and strip a list of residue names for comparison."""
     return [str(name).strip().upper() for name in (names or []) if str(name).strip()]
@@ -128,8 +146,10 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
                     continue
                 for residue in chain:
                     if residue.id[0] == ' ':
-                        # Standard amino acid — add all atoms to reference
-                        protein_atoms.extend(residue.get_atoms())
+                        # Only atoms that can hydrogen bond count as anchors;
+                        # proximity to a carbon does not hold a water in place.
+                        protein_atoms.extend(
+                            a for a in residue.get_atoms() if _can_hydrogen_bond(a))
                     elif _is_water_residue(residue):
                         water_residues.append((chain.id, residue))
 
@@ -140,7 +160,8 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
             for chain_id, water_res in water_residues:
                 for w_atom in water_res.get_atoms():
                     if _is_water_oxygen(w_atom):
-                        nearby_protein_atoms = ns.search(w_atom.get_coord(), 4.0)
+                        nearby_protein_atoms = ns.search(w_atom.get_coord(),
+                                                    STRUCTURAL_WATER_CUTOFF)
                         if nearby_protein_atoms:
                             # Qualify by chain: residue ids repeat across chains,
                             # so a bare id would keep unrelated waters elsewhere.
