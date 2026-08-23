@@ -25,14 +25,22 @@ def _split_records(pdb_path):
     the force fields have templates for them. Everything else flagged HETATM
     (drugs, cofactors, lipids, unparameterised ions) is held out verbatim.
 
+    Only the first model is read. The MODEL/ENDMDL markers are dropped on
+    write, so keeping later models would weld an NMR ensemble into a single
+    chimeric protein with every residue repeated once per model.
+
     Returns (biopolymer_lines, ligand_lines, conect_lines).
     """
     biopolymer, ligand, conect = [], [], []
     ligand_serials = set()
+    past_first_model = False
 
     with open(pdb_path, 'r') as fh:
         for line in fh:
             record = line[:6]
+
+            if past_first_model:
+                continue
 
             if record in ('ATOM  ', 'HETATM'):
                 resname = line[17:20].strip()
@@ -53,7 +61,11 @@ def _split_records(pdb_path):
             elif record == 'CONECT':
                 conect.append(line)
 
-            elif record in ('TER   ', 'ENDMDL', 'END   ', 'MODEL '):
+            elif record == 'ENDMDL':
+                # Everything past here belongs to a later model.
+                past_first_model = True
+
+            elif record in ('TER   ', 'END   ', 'MODEL '):
                 # Structural records are regenerated on write; drop them.
                 continue
             else:
@@ -88,10 +100,16 @@ def _merge(protein_pdb_path, ligand_lines, ligand_conect, output_path):
     rewriting CONECT records to match.
     """
     protein_lines = []
+    protein_conect = []
     max_serial = 0
     with open(protein_pdb_path, 'r') as fh:
         for line in fh:
             if line.startswith('END'):
+                continue
+            if line[:6] == 'CONECT':
+                # Held back so every CONECT lands after the last atom record,
+                # which is where the PDB spec puts them.
+                protein_conect.append(line)
                 continue
             if line[:6] in ('ATOM  ', 'HETATM'):
                 try:
@@ -126,6 +144,7 @@ def _merge(protein_pdb_path, ligand_lines, ligand_conect, output_path):
         if renumbered:
             out.write('TER\n')
             out.writelines(renumbered)
+        out.writelines(protein_conect)
         out.writelines(remapped_conect)
         out.write('END\n')
 

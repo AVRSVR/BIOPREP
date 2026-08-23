@@ -144,6 +144,62 @@ class TestProtonator(TempDirTest):
         with self.assertRaises(ValueError):
             protonator.add_hydrogens(source, self.path('out.pdb'))
 
+    def test_multi_model_input_is_not_concatenated(self):
+        """MODEL/ENDMDL are dropped on write, so later models must not be read."""
+        lines = _protein_lines()
+        single = _write(self.path('single.pdb'), lines)
+
+        multi = self.path('multi.pdb')
+        with open(multi, 'w') as fh:
+            for index in (1, 2, 3):
+                fh.write('MODEL     %4d\n' % index)
+                fh.writelines(lines)
+                fh.write('ENDMDL\n')
+            fh.write('END\n')
+
+        def atom_count(path):
+            return sum(1 for l in pathlib.Path(path).read_text().splitlines()
+                       if l.startswith(('ATOM', 'HETATM')))
+
+        protonator.add_hydrogens(single, self.path('out_single.pdb'))
+        protonator.add_hydrogens(multi, self.path('out_multi.pdb'))
+
+        self.assertEqual(atom_count(self.path('out_multi.pdb')),
+                         atom_count(self.path('out_single.pdb')),
+                         'models were welded into one chimeric protein')
+
+    def test_conect_records_follow_the_last_atom(self):
+        """The PDB spec puts CONECT after every coordinate record."""
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        lines += [
+            'HETATM 9001  C1  BTN A 900    %8.3f%8.3f%8.3f  1.00  0.00           C  \n' % (x + 5, y, z),
+            'HETATM 9002  C2  BTN A 900    %8.3f%8.3f%8.3f  1.00  0.00           C  \n' % (x + 6.5, y, z),
+            'CONECT 9001 9002\n',
+            'CONECT 9002 9001\n',
+        ]
+        source = _write(self.path('in.pdb'), lines)
+        protonator.add_hydrogens(source, self.path('out.pdb'))
+
+        written = pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+        last_atom = max(i for i, l in enumerate(written)
+                        if l.startswith(('ATOM', 'HETATM')))
+        first_conect = min(i for i, l in enumerate(written) if l.startswith('CONECT'))
+        self.assertGreater(first_conect, last_atom,
+                           'a CONECT record precedes an atom record')
+
+        # The ligand's own bonds must point at its renumbered serials.
+        btn = [l for l in written if l[17:20].strip() == 'BTN']
+        serials = {int(l[6:11]) for l in btn}
+        bonded = set()
+        for line in (l for l in written if l.startswith('CONECT')):
+            body = line[6:].rstrip()
+            refs = {int(body[i:i + 5]) for i in range(0, len(body), 5)
+                    if body[i:i + 5].strip()}
+            if refs & serials:
+                bonded |= refs
+        self.assertEqual(bonded, serials, 'ligand CONECT serials were not remapped')
+
 
 class TestMinimizer(TempDirTest):
 
