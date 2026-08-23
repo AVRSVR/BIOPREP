@@ -1353,6 +1353,68 @@ class TestSiteAnalyzer(TempDirTest):
         finally:
             site_analyzer.MAX_PHARMACOPHORES = original
 
+    def test_feature50_large_box_coarsens_the_grid(self):
+        """Memory guard: a 1.5 A grid over a virus-sized box is unaffordable."""
+        import numpy as np
+
+        class FakeAtom:
+            def __init__(self, coord):
+                self._coord = np.array(coord, dtype=float)
+
+            def get_coord(self):
+                return self._coord
+
+        analyzer_obj = site_analyzer.BindingSiteAnalyzer.__new__(
+            site_analyzer.BindingSiteAnalyzer)
+        span = np.linspace(0, 200, 10)
+        analyzer_obj.coords = np.array(
+            [[x, y, z] for x in span for y in span for z in span])
+        analyzer_obj.atoms = [FakeAtom(c) for c in analyzer_obj.coords]
+        analyzer_obj.RESIDUE_PROPS = site_analyzer.RESIDUE_PROPS
+
+        _, resolution = analyzer_obj._detect_pockets(grid_res=1.5)
+        self.assertGreater(resolution, 1.5)
+
+        box = float(np.prod(analyzer_obj.coords.max(axis=0)
+                            - analyzer_obj.coords.min(axis=0) + 10))
+        self.assertLessEqual(box / resolution ** 3, 250000 * 1.05)
+
+    def test_feature57_pockets_sorted_and_renumbered(self):
+        source = self._protonated()
+        sites = site_analyzer.BindingSiteAnalyzer(source).analyze()
+
+        self.assertLessEqual(len(sites), site_analyzer.MAX_POCKETS)
+        scores = [s['drugability_score'] for s in sites]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual([s['id'] for s in sites], list(range(1, len(sites) + 1)))
+        self.assertTrue(all(s['volume'] >= site_analyzer.MIN_POCKET_VOLUME
+                            for s in sites))
+
+    def test_feature58_residue_property_table(self):
+        props = site_analyzer.RESIDUE_PROPS
+        self.assertEqual(len(props), 20)
+        self.assertEqual(set(props.values()),
+                         {'HYDROPHOBIC', 'POLAR', 'CHARGED_NEG',
+                          'CHARGED_POS', 'NEUTRAL'})
+        self.assertEqual(props['ASP'], 'CHARGED_NEG')
+        self.assertEqual(props['LYS'], 'CHARGED_POS')
+
+    def test_feature69_summary_matches_the_sites(self):
+        source = self._protonated()
+        analyzer_obj = site_analyzer.BindingSiteAnalyzer(source)
+        sites = analyzer_obj.analyze()
+        summary = analyzer_obj.get_summary(sites)
+
+        self.assertEqual(summary['site_count'], len(sites))
+        self.assertAlmostEqual(summary['total_volume'],
+                               sum(s['volume'] for s in sites), places=1)
+        if sites:
+            self.assertEqual(summary['primary_volume'], sites[0]['volume'])
+
+        empty = analyzer_obj.get_summary([])
+        self.assertEqual(empty['site_count'], 0)
+        self.assertIn('No significant', empty['text'])
+
     def test_empty_structure_returns_no_pockets(self):
         source = _write(self.path('tiny.pdb'), _protein_lines()[:3])
         self.assertEqual(site_analyzer.BindingSiteAnalyzer(source).analyze(), [])
