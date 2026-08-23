@@ -301,3 +301,40 @@ Two changes the old frontend has not caught up with:
 
 A returned file is never proof that minimisation ran — check
 `energy_minimization.status`.
+
+---
+
+## Science audit
+
+Feature verification asks whether the code does what the catalogue says.
+This asks whether the answer is physically defensible. It was run against
+deposited structures — 1STP (streptavidin + biotin), 1HSG (HIV-1 protease +
+MK1), 4INS (insulin + zinc) — because 1CRN is small, capped, ligand-free and
+pocket-free, and hid every defect below.
+
+### Defects found and fixed
+
+| Finding | Evidence | Fix |
+|---|---|---|
+| Structures with an uncapped C-terminus cannot be minimised at all | 1STP has **zero OXT atoms**; every tier failed. 1HSG likewise. | Terminals are always repaired via PDBFixer's `missingTerminals`, separately from the optional side-chain rebuilding. 1STP now reaches −15149 kJ/mol. |
+| Pocket detection depended on molecular orientation | Rotating streptavidin 45° changed total cavity volume by **+47.8%** for a physically identical cavity | Scan all seven LIGSITE axes (three Cartesian + four cubic diagonals) in both senses. Worst drift over five rotations: **8.9%**, the remainder being the axis-aligned grid. |
+| Tier 2 let the pocket collapse onto the restored ligand | With biotin deleted, 27 of 67 lining atoms moved inward; closest contact tightened 2.58 → 2.17 Å | Harmonic restraints (5000 kJ/mol/nm²) on atoms within 5 Å of a deleted residue: 7 of 67, closest 2.45 Å |
+| "Structural" waters kept with no hydrogen bond | 8 of 78 retained waters on 1STP had no N/O/S within 3.5 Å — the rule counted carbon | Reference set is now hydrogen-bond-capable atoms at 3.5 Å. Zero spurious across all three structures. |
+| PDBQT receptors typed every hydrogen as a donor | `-xh` means *preserve* hydrogens, not merge non-polar ones. 842 hydrogens all typed `HD` versus 213 genuinely polar. | Option removed; the default merges non-polar hydrogens, giving the conventional receptor |
+| `converged` measured the wrong thing | It reported the energy having fallen, so a 100-iteration run "converged" while 1000 iterations went 900 kJ/mol lower | Compares RMS force against the tolerance `minimizeEnergy` was given. 1CRN: 5 iters → 695, False; 100 → 15.4, False; 1000 → 5.05, True |
+| Bond constraints made convergence unmeasurable | `HBonds` put constraint forces into `getForces()`; RMS force never approached the tolerance | Minimisation is unconstrained — nothing here integrates dynamics. 1CRN: −5166.9 kJ/mol and RMS 5.76 versus −5162.7 and 71.16 |
+
+### Verified correct
+
+- Disulfide cysteines are left oxidised; no HG is added to a bridged SG.
+- Ligand coordinates are byte-identical through the pipeline, and no hydrogens are added to them.
+- Pocket detection finds the real site: with the ligand deleted first, 1STP's **top-ranked** pocket sits 6.3 Å from the biotin centroid, lined by the actual binding residues.
+- LYS, HIS, ASP and GLU titrate at approximately the right pH.
+- Gasteiger charges are chemically sensible: O and N negative, carbon near zero.
+
+### Known limits, not fixed
+
+- **Tyrosine is never deprotonated.** OpenMM has no tyrosinate variant, so the hydroxyl survives above pKa 10.1.
+- **pKa values are model-compound values.** No structure-specific prediction, so a buried or salt-bridged residue with a shifted pKa gets the wrong state — worst exactly where it matters, at a catalytic residue.
+- **The drugability score is an unvalidated heuristic.** On 1HSG the real inhibitor site is found (6.2 Å, largest volume, lined by the catalytic Asp dyad and flap) but ranks **last of five**: the volume term penalises it for exceeding 300–1000 Å³ and concavity for being an open cavity — the very properties that let it bind a peptidomimetic. Two of the five factors, property diversity and pharmacophore density, are 1.00 for every pocket and do no discriminating work. The five sub-scores are returned per pocket so the ranking can be argued with; the weights were deliberately **not** retuned, since fitting them to two structures would be overfitting dressed as improvement.
+- **Ligands are never parameterised.** Tier 2 excludes them rather than generating GAFF or CGenFF parameters, so a ligand's internal geometry is never optimised.

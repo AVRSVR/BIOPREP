@@ -1,6 +1,28 @@
 """
 pH-dependent protonation that does not let PDBFixer touch ligands.
 
+What the pH argument actually buys, measured on HIV-1 protease (1HSG):
+
+  LYS   three HZ below pH 11, two above          correct, pKa about 10.5
+  HIS   HIP at pH 2, neutral HID from 7.4 up     correct, pKa about 6
+  ASP   protonated below about pH 5              correct
+  GLU   protonated below about pH 5              correct
+  TYR   keeps its HH at every pH, up to 13       NOT handled
+
+Two limits worth knowing about before trusting a protonation state:
+
+* Tyrosine is never deprotonated. OpenMM's Modeller has no tyrosinate
+  variant, so above pKa 10.1 the hydroxyl stays put.
+* The pKa values are model-compound values applied uniformly. There is no
+  structure-specific pKa prediction here - nothing like PROPKA - so a buried
+  or salt-bridged residue whose pKa is shifted by several units will be
+  assigned the wrong state at physiological pH. That matters most for a
+  catalytic residue, which is exactly where the shift tends to be largest.
+
+The histidine tautomer, HID or HIE, is chosen by OpenMM from the local
+hydrogen-bonding environment rather than fixed; on 1HSG both histidines come
+out HID.
+
 PDBFixer has no templates for arbitrary small molecules. Handed a
 protein-ligand complex it will try to template-match the ligand and can
 strip atoms or add nonsensical hydrogens to it. The fix is to hold the
