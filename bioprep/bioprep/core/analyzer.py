@@ -1,82 +1,119 @@
-from Bio.PDB import PDBParser
+"""
+Structural metadata extraction.
+
+Counts come from the first model only. Iterating every model silently
+multiplied atom counts, water counts and detected gaps by the model count,
+so a 20-model NMR ensemble reported twenty times the real numbers.
+"""
+
+from .residues import is_water
+
+
+def _first_model(structure):
+    """Return the first model, or None for an empty structure."""
+    for model in structure:
+        return model
+    return None
 
 
 def analyze_structure(structure):
     """
-    Parses a Biopython Structure object to extract metadata for the UI:
-    - Lists of available chains
-    - Total water counts
-    - Unique list of heteroatoms/ligands
-    - Total protein atom count (waters excluded)
-    - Sequence gap detection (missing residues between observed residues)
+    Extract metadata for the UI from the first model of a structure.
+
+    Returns chain ids, water and heteroatom inventory, atom counts broken down
+    by category, sequence gaps, and the number of models present.
     """
     chains = []
     water_count = 0
     heteroatoms = set()
-    atoms_total = 0
-    sequence_gaps = []  # FIX: actually detect gaps now
+    protein_atoms = 0
+    water_atoms = 0
+    hetero_atoms = 0
+    sequence_gaps = []
 
-    for model in structure:
+    model_count = sum(1 for _ in structure)
+    model = _first_model(structure)
+
+    if model is not None:
         for chain in model:
-            chain_id = chain.id
-            chains.append(chain_id)
-            prev_resseq = None  # Track previous residue sequence number
+            chains.append(chain.id)
+            prev_resseq = None
 
             for residue in chain:
                 hetfield = residue.id[0]
                 resseq = residue.id[1]
+                atom_count = len(residue.get_list())
 
-                # Count all atoms for total structure count
-                atoms_count = len(residue.get_list())
-                atoms_total += atoms_count
-
-                if hetfield == 'W':
+                if hetfield == 'W' or is_water(residue.resname):
                     water_count += 1
+                    water_atoms += atom_count
                     continue
-                elif hetfield != ' ' and hetfield != 'W':
-                    res_name = residue.resname.strip()
-                    heteroatoms.add(res_name)
+
+                if hetfield != ' ':
+                    heteroatoms.add(residue.resname.strip())
+                    hetero_atoms += atom_count
                     continue
-                else:
-                    # Standard amino acid – check sequence gaps
 
+                protein_atoms += atom_count
 
-                    # FIX: Gap detection — using prev_resseq which was dead before
-                    if prev_resseq is not None and (resseq - prev_resseq) > 1:
-                        # Gap detected: residues between prev_resseq+1 and resseq-1
-                        gap_size = resseq - prev_resseq - 1
-                        sequence_gaps.append({
-                            "chain": chain_id,
-                            "from": prev_resseq,
-                            "to": resseq,
-                            "missing_count": gap_size
-                        })
+                # Gap detection: a jump in residue numbering between two
+                # consecutive observed standard residues.
+                if prev_resseq is not None and (resseq - prev_resseq) > 1:
+                    sequence_gaps.append({
+                        "chain": chain.id,
+                        "from": prev_resseq,
+                        "to": resseq,
+                        "missing_count": resseq - prev_resseq - 1,
+                    })
+                prev_resseq = resseq
 
-                    prev_resseq = resseq
+    atoms_total = protein_atoms + water_atoms + hetero_atoms
 
     return {
-        'chains': sorted(list(set(chains))),
+        'chains': sorted(set(chains)),
         'water_count': water_count,
-        'heteroatoms': sorted(list(heteroatoms)),
+        'heteroatoms': sorted(heteroatoms),
+        # Whole-structure count for the first model, all categories included.
         'atoms_total': atoms_total,
-        'atoms_before': atoms_total,   # protein-only pre-processing count
-        'sequence_gaps': sequence_gaps,  # newly detected gaps
+        'atoms_before': atoms_total,
+        'atom_breakdown': {
+            'protein': protein_atoms,
+            'water': water_atoms,
+            'heteroatom': hetero_atoms,
+        },
+        'sequence_gaps': sequence_gaps,
+        'model_count': model_count,
     }
 
 
 def detect_missing_residues(pdb_path):
     """
-    Uses PDBFixer to detect missing residues without rebuilding.
-    Returns a list of (chain_id, residue_number) tuples for reporting.
+    Report residues present in SEQRES but absent from the coordinates.
+
+    PDBFixer keys ``missingResidues`` by ``(chain_index, insertion_position)``.
+    Reading that tuple as ``(model, chain_id)`` — as this once did — labelled
+    every gap with a residue offset in place of the chain.
     """
     try:
         from pdbfixer import PDBFixer
+
         fixer = PDBFixer(filename=pdb_path)
         fixer.findMissingResidues()
+
+        chains = list(fixer.topology.chains())
         missing = []
-        for (model_idx, chain_id), residues in fixer.missingResidues.items():
-            for r in residues:
-                missing.append({"chain": chain_id, "residue": str(r)})
+        for (chain_index, insert_at), residue_names in fixer.missingResidues.items():
+            try:
+                chain_id = chains[chain_index].id
+            except (IndexError, AttributeError):
+                chain_id = str(chain_index)
+
+            for offset, name in enumerate(residue_names):
+                missing.append({
+                    "chain": chain_id,
+                    "residue": name,
+                    "position": insert_at + offset,
+                })
         return missing
     except Exception:
         return []

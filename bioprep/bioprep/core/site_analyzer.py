@@ -1,347 +1,352 @@
+"""
+Grid-based binding-site detection and characterisation.
+
+Pockets are found by marking grid points that sit in the shell just outside
+the protein surface, keeping those enclosed by protein in at least three of
+six axis directions (a LIGSITE-style test), and clustering what survives.
+"""
+
 import numpy as np
-import os
-from Bio.PDB import PDBParser, NeighborSearch, Selection
+from Bio.PDB import PDBParser, NeighborSearch
 from typing import List, Dict, Any
+
+from .residues import is_water
+
+# Residue property classes used for pocket characterisation.
+RESIDUE_PROPS = {
+    'ALA': 'HYDROPHOBIC', 'VAL': 'HYDROPHOBIC', 'LEU': 'HYDROPHOBIC', 'ILE': 'HYDROPHOBIC',
+    'PRO': 'HYDROPHOBIC', 'PHE': 'HYDROPHOBIC', 'TRP': 'HYDROPHOBIC', 'MET': 'HYDROPHOBIC',
+    'SER': 'POLAR', 'THR': 'POLAR', 'CYS': 'POLAR', 'TYR': 'POLAR', 'ASN': 'POLAR', 'GLN': 'POLAR',
+    'ASP': 'CHARGED_NEG', 'GLU': 'CHARGED_NEG',
+    'LYS': 'CHARGED_POS', 'ARG': 'CHARGED_POS', 'HIS': 'CHARGED_POS',
+    'GLY': 'NEUTRAL',
+}
+
+SIDECHAIN_ACCEPTORS = {'OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH'}
+SIDECHAIN_DONORS = {'NZ', 'NH1', 'NH2', 'ND1', 'NE2', 'ND2', 'NE1'}
+BACKBONE_ACCEPTOR = 'O'
+BACKBONE_DONOR = 'N'
+HYDROPHOBIC_RES = {'ALA', 'VAL', 'LEU', 'ILE', 'MET'}
+HYDROPHOBIC_ATOMS = {'CB', 'CG', 'CD', 'CE'}
+AROMATIC_RES = {'PHE', 'TRP', 'TYR', 'HIS'}
+AROMATIC_RING_ATOMS = {'CG', 'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CH2', 'NE1'}
+
+MAX_PHARMACOPHORES = 40
+MIN_POCKET_VOLUME = 50.0
+MAX_POCKETS = 5
+
+# Feature ranking used when trimming to MAX_PHARMACOPHORES. Sidechain and
+# aromatic features characterise a pocket; backbone N/O occur in every residue
+# and would otherwise crowd everything else out of the list.
+PRIORITY = {'AROMATIC': 0, 'SIDECHAIN': 1, 'HYDROPHOBIC': 2, 'BACKBONE': 3}
 
 
 class BindingSiteAnalyzer:
-    def __init__(self, pdb_path: str):
+    def __init__(self, pdb_path: str, ignore_hydrogens: bool = True,
+                 ignore_waters: bool = True):
+        """
+        Load a structure for pocket analysis.
+
+        Hydrogens and waters are excluded by default. Pocket geometry is
+        defined by heavy atoms; including hydrogens shrinks every measured
+        cavity, and retained waters fill the very pockets being looked for —
+        which matters because this runs on protonated, prepared structures.
+        """
         self.pdb_path = pdb_path
         self.parser = PDBParser(QUIET=True)
         self.structure = self.parser.get_structure("protein", pdb_path)
-        self.atoms = list(self.structure.get_atoms())
-        self.coords = np.array([atom.get_coord() for atom in self.atoms])
 
-        # Residue properties mapping
-        self.RESIDUE_PROPS = {
-            'ALA': 'HYDROPHOBIC', 'VAL': 'HYDROPHOBIC', 'LEU': 'HYDROPHOBIC', 'ILE': 'HYDROPHOBIC',
-            'PRO': 'HYDROPHOBIC', 'PHE': 'HYDROPHOBIC', 'TRP': 'HYDROPHOBIC', 'MET': 'HYDROPHOBIC',
-            'SER': 'POLAR', 'THR': 'POLAR', 'CYS': 'POLAR', 'TYR': 'POLAR', 'ASN': 'POLAR', 'GLN': 'POLAR',
-            'ASP': 'CHARGED_NEG', 'GLU': 'CHARGED_NEG',
-            'LYS': 'CHARGED_POS', 'ARG': 'CHARGED_POS', 'HIS': 'CHARGED_POS',
-            'GLY': 'NEUTRAL'
-        }
+        model = next(iter(self.structure), None)
+        source = model if model is not None else self.structure
+
+        atoms = []
+        for atom in source.get_atoms():
+            if ignore_hydrogens and atom.element == 'H':
+                continue
+            if ignore_hydrogens and atom.get_name().strip().startswith('H'):
+                continue
+            if ignore_waters and is_water(atom.get_parent().get_resname()):
+                continue
+            atoms.append(atom)
+
+        self.atoms = atoms
+        self.coords = (np.array([a.get_coord() for a in atoms])
+                       if atoms else np.empty((0, 3)))
+        self.RESIDUE_PROPS = RESIDUE_PROPS
+
+    # ── public API ───────────────────────────────────────────────────────────
 
     def analyze(self) -> List[Dict[str, Any]]:
-        """Main analysis pipeline."""
-        pockets = self._detect_pockets()
+        """Detect pockets and characterise each one."""
+        if len(self.coords) < 10:
+            return []
+
+        pockets, grid_res = self._detect_pockets()
 
         results = []
-        for i, pocket in enumerate(pockets):
-            pocket_points = np.array(pocket['points'])
-            site_info = self._analyze_specific_site(pocket_points)
-            site_info['id'] = i + 1
-            results.append(site_info)
+        for pocket in pockets:
+            info = self._analyze_specific_site(np.array(pocket['points']), grid_res)
+            results.append(info)
 
-        # Sort by drugability score descending
-        results.sort(key=lambda x: x['drugability_score'], reverse=True)
-        
-        # Filter out tiny pockets and cap at top 5
-        results = [r for r in results if r['volume'] >= 50]
-        results = results[:5]
-        
-        # Normalize IDs to be sequential
-        for idx, res in enumerate(results):
-            res['id'] = idx + 1
-            
+        results = [r for r in results if r['volume'] >= MIN_POCKET_VOLUME]
+        results.sort(key=lambda r: r['drugability_score'], reverse=True)
+        results = results[:MAX_POCKETS]
+
+        for index, result in enumerate(results):
+            result['id'] = index + 1
         return results
 
     def get_summary(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Generates a high-level summary of all discovered sites."""
+        """High-level summary across all discovered sites."""
         if not results:
             return {
                 "text": "No significant binding pockets were detected.",
                 "site_count": 0,
                 "primary_volume": 0.0,
                 "total_volume": 0.0,
-                "total_features": 0
+                "total_features": 0,
             }
 
-        # Primary site is the first one in sorted results
-        primary_site = results[0]
-        primary_vol = primary_site['volume']
-        primary_score = primary_site['drugability_score']
-        
-        total_cavity_vol = sum(r['volume'] for r in results)
+        primary = results[0]
+        total_volume = sum(r['volume'] for r in results)
         total_features = sum(len(r['pharmacophore_points']) for r in results)
 
-        summary_text = (
+        text = (
             f"Analysis complete. Found **{len(results)} distinct pockets** "
-            f"with a **Total Cavity Space of {total_cavity_vol:.1f} Å³**. "
-            f"The **Primary Binding Site** has a volume of **{primary_vol:.1f} Å³** "
-            f"and a drugability score of **{primary_score}**, suggesting a "
-            "strong host-guest fit for typical small molecules."
+            f"with a **Total Cavity Space of {total_volume:.1f} Å³**. "
+            f"The **Primary Binding Site** has a volume of "
+            f"**{primary['volume']:.1f} Å³** and a drugability score of "
+            f"**{primary['drugability_score']}**."
         )
 
         return {
-            "text": summary_text,
+            "text": text,
             "site_count": len(results),
-            "primary_volume": primary_vol,
-            "total_volume": total_cavity_vol,
-            "total_features": total_features
+            "primary_volume": primary['volume'],
+            "total_volume": total_volume,
+            "total_features": total_features,
         }
 
+    # ── pocket detection ─────────────────────────────────────────────────────
 
-    def _detect_pockets(self, grid_res: float = 1.5, probe_radius: float = 2.8) -> List[np.ndarray]:
+    def _detect_pockets(self, grid_res: float = 1.5, probe_radius: float = 2.8):
         """
-        Grid-based pocket detection using geometric enclosure filtering.
+        Find candidate pocket clusters.
+
+        Returns ``(pockets, grid_res)``. The resolution is returned because it
+        may have been coarsened for a large structure, and the volume of a
+        pocket depends on it — assuming 1.5 Å regardless understated every
+        volume for exactly the structures that needed scaling.
         """
         from scipy.spatial import KDTree
         from sklearn.cluster import DBSCAN
-        import numpy as np
 
         min_coords = np.min(self.coords, axis=0) - 5
         max_coords = np.max(self.coords, axis=0) + 5
 
-        # DYNAMIC GRID SCALING: Protect against MemoryError on huge complexes (e.g. virus capsids)
-        box_vol = np.prod(max_coords - min_coords)
+        # Coarsen the grid rather than exhaust memory on very large complexes.
+        box_volume = float(np.prod(max_coords - min_coords))
         target_max_points = 250000
-        if (box_vol / (grid_res**3)) > target_max_points:
-            grid_res = (box_vol / target_max_points) ** (1/3.0)
-            grid_res = max(1.5, round(grid_res, 1))
+        if (box_volume / (grid_res ** 3)) > target_max_points:
+            grid_res = max(1.5, round((box_volume / target_max_points) ** (1 / 3.0), 1))
 
-        x = np.arange(min_coords[0], max_coords[0], grid_res)
-        y = np.arange(min_coords[1], max_coords[1], grid_res)
-        z = np.arange(min_coords[2], max_coords[2], grid_res)
-        grid_points = np.array(np.meshgrid(x, y, z)).T.reshape(-1, 3)
+        axes = [np.arange(min_coords[i], max_coords[i], grid_res) for i in range(3)]
+        grid_points = np.array(np.meshgrid(*axes)).T.reshape(-1, 3)
 
         tree = KDTree(self.coords)
-        
-        # Pre-filter: grid points must be near at least one protein atom (between probe and 7.5A)
-        # But for enclosure check, we need all neighbors within a larger radius.
+
+        # Candidates sit in the shell outside the surface: past the probe
+        # radius, but not out in bulk solvent.
         min_dists, _ = tree.query(grid_points, k=1)
-        potential_mask = (min_dists > probe_radius) & (min_dists < 7.5)
-        potential_points = grid_points[potential_mask]
-        
-        if len(potential_points) == 0:
-            return []
+        candidates = grid_points[(min_dists > probe_radius) & (min_dists < 7.5)]
+        if len(candidates) == 0:
+            return [], grid_res
 
-        # Find neighbors for all potential points in one go if possible, or per-point
-        # Dist-based search for enclosure
-        all_neighbor_idxs = tree.query_ball_point(potential_points, 13.0)
+        neighbour_lists = tree.query_ball_point(candidates, 13.0)
 
-        # ── ENCLOSURE CHECK (LIGSITE style - Optimized) ────────────────────────
-        enclosed_points = []
+        enclosed = []
         max_dist = 12.0
-        
-        dimensions = [
-            (0, 1.0), (0, -1.0), # X+, X-
-            (1, 1.0), (1, -1.0), # Y+, Y-
-            (2, 1.0), (2, -1.0)  # Z+, Z-
-        ]
+        directions = [(0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)]
 
-        for i, point in enumerate(potential_points):
-            nb_idx = all_neighbor_idxs[i]
-            if len(nb_idx) < 10: continue
-            
-            nearby_coords = self.coords[nb_idx]
-            # Use distance squared to avoid unnecessary sqrt operations
-            vectors = nearby_coords - point
-            dist_sq = np.sum(vectors**2, axis=1)
-            
-            hit_dirs = 0
-            for axis_idx, sign in dimensions:
-                # Fast projection for axis-aligned rays
-                projs = vectors[:, axis_idx] * sign
-                
-                # Pythagorean: perp_dist^2 = dist^2 - proj^2
-                # We need perp_dist < 2.5 => perp_dist^2 < 6.25
-                perp_sq = dist_sq - projs**2
-                
-                mask = (projs > 1.5) & (projs < max_dist) & (perp_sq < 6.25)
-                if np.any(mask):
-                    hit_dirs += 1
-                    # Performance: 3 directions is the threshold for a pocket point.
-                    # Early exit once we cross the threshold for this grid point.
-                    if hit_dirs >= 3:
-                        enclosed_points.append(point)
+        for i, point in enumerate(candidates):
+            neighbours = neighbour_lists[i]
+            if len(neighbours) < 10:
+                continue
+
+            vectors = self.coords[neighbours] - point
+            dist_sq = np.sum(vectors ** 2, axis=1)
+
+            hits = 0
+            for axis, sign in directions:
+                projections = vectors[:, axis] * sign
+                # Perpendicular distance from the ray, via Pythagoras.
+                perpendicular_sq = dist_sq - projections ** 2
+                blocked = ((projections > 1.5) & (projections < max_dist)
+                           & (perpendicular_sq < 6.25))
+                if np.any(blocked):
+                    hits += 1
+                    if hits >= 3:
+                        enclosed.append(point)
                         break
 
-        if not enclosed_points:
-            return []
+        if not enclosed:
+            return [], grid_res
 
-        # ── CLUSTERING ───────────────────────────────────────────────────────
-        points_np = np.array(enclosed_points)
-        clustering = DBSCAN(eps=grid_res * 1.5, min_samples=10).fit(points_np)
-        labels = clustering.labels_
-        
+        points = np.array(enclosed)
+        labels = DBSCAN(eps=grid_res * 1.5, min_samples=10).fit(points).labels_
+
         pockets = []
-        unique_labels = set(labels)
-        for label in unique_labels:
-            if label == -1: continue
-            
-            cluster_points = points_np[labels == label]
-            volume = len(cluster_points) * (grid_res ** 3)
-            
-            # Standard drug-like pocket is 400-1200 A^3
-            drugability = 0.0
-            if volume > 300:
-                drugability = min(0.95, 0.4 + (volume / 2000))
-            else:
-                drugability = volume / 750
-            
-            centroid = np.mean(cluster_points, axis=0)
+        for label in set(labels):
+            if label == -1:
+                continue
+            cluster = points[labels == label]
             pockets.append({
-                'id': int(label) + 1,
-                'centroid': centroid.tolist(),
-                'volume': round(volume, 1),
-                'points': cluster_points.tolist(),
-                'drugability_score': round(drugability, 2)
+                'centroid': np.mean(cluster, axis=0).tolist(),
+                'points': cluster.tolist(),
             })
 
-        return sorted(pockets, key=lambda x: x['volume'], reverse=True)
+        pockets.sort(key=lambda p: len(p['points']), reverse=True)
+        return pockets, grid_res
 
-    def _analyze_specific_site(self, points: np.ndarray) -> Dict[str, Any]:
-        """Detailed analysis of a single pocket cluster, with improved drugability scoring."""
+    # ── pocket characterisation ──────────────────────────────────────────────
+
+    def _analyze_specific_site(self, points: np.ndarray, grid_res: float) -> Dict[str, Any]:
+        """Characterise one pocket cluster."""
         centroid = np.mean(points, axis=0)
-        
-        # FIX: More accurate volume: count grid cells with the actual grid res (1.5Å)
-        # Each grid voxel = 1.5³ = 3.375 Å³
-        voxel_volume = 1.5 ** 3
-        volume = len(points) * voxel_volume
+        volume = len(points) * (grid_res ** 3)
 
-        # Find nearby residues (10Å from centroid)
-        ns = NeighborSearch(self.atoms)
-        nearby_atoms = ns.search(centroid, 10.0)
-        nearby_residues = list(set([a.get_parent() for a in nearby_atoms]))
+        neighbour_search = NeighborSearch(self.atoms)
+        nearby_atoms = neighbour_search.search(centroid, 10.0)
 
-        res_list = []
+        residues = {atom.get_parent() for atom in nearby_atoms}
         props_counts = {'HYDROPHOBIC': 0, 'POLAR': 0, 'CHARGED': 0}
+        labelled = []
 
-        for res in nearby_residues:
-            res_name = res.get_resname()
-            prop = self.RESIDUE_PROPS.get(res_name, 'OTHER')
-            res_list.append(f"{res_name}{res.get_id()[1]}")
-
-            if 'HYDROPHOBIC' in prop:
+        for residue in residues:
+            name = residue.get_resname().strip()
+            prop = RESIDUE_PROPS.get(name)
+            if prop is None:
+                continue  # ligands, ions and anything non-standard
+            labelled.append((
+                float(np.linalg.norm(residue.child_list[0].get_coord() - centroid)),
+                f"{name}{residue.get_id()[1]}",
+            ))
+            if prop == 'HYDROPHOBIC':
                 props_counts['HYDROPHOBIC'] += 1
-            elif 'POLAR' in prop:
+            elif prop == 'POLAR':
                 props_counts['POLAR'] += 1
-            elif 'CHARGED' in prop:  # Catches CHARGED_POS and CHARGED_NEG both
+            elif prop.startswith('CHARGED'):
                 props_counts['CHARGED'] += 1
 
-        # Pharmacophore features
+        # Report the closest lining residues rather than an arbitrary slice.
+        labelled.sort()
+        residue_list = [name for _, name in labelled[:15]]
+
         pharmacophores = self._predict_pharmacophores(nearby_atoms, centroid)
 
-        # ── IMPROVED Drugability Score ────────────────────────────────────────
-        # Factor 1: Volume (target: 300–1000 Å³ for drug-like molecules)
-        volume_score = 0.0
+        # ── Drugability, five weighted factors ───────────────────────────────
         if volume < 100:
-            volume_score = 0.1  # Too small
+            volume_score = 0.1
         elif volume < 300:
             volume_score = 0.4 + (volume - 100) / 500
         elif volume <= 1000:
             volume_score = 1.0
         else:
-            volume_score = max(0.3, 1.0 - (volume - 1000) / 3000)  # Too large = less specific
+            volume_score = max(0.3, 1.0 - (volume - 1000) / 3000)
 
-        # Factor 2: Property diversity (having all 3 property types is best)
         prop_diversity = len([v for v in props_counts.values() if v > 0]) / 3.0
 
-        # Factor 3: Hydrophobic balance (~40% hydrophobic is ideal)
         total_props = sum(props_counts.values()) + 1
-        hphob_ratio = props_counts['HYDROPHOBIC'] / total_props
-        balance_score = max(0.0, 1.0 - abs(hphob_ratio - 0.4) * 2)
+        hydrophobic_ratio = props_counts['HYDROPHOBIC'] / total_props
+        balance_score = max(0.0, 1.0 - abs(hydrophobic_ratio - 0.4) * 2)
 
-        # Factor 4: Concavity (enclosure) — FIX: NEW — pocket should be geometrically enclosed
-        # Estimate using standard deviation of pocket point distances from centroid.
-        # A tightly clustered enclosed pocket has lower std dev relative to centroid distance.
-        dists_from_centroid = np.linalg.norm(points - centroid, axis=1)
-        mean_dist = np.mean(dists_from_centroid)
-        std_dist = np.std(dists_from_centroid)
-        # Concavity proxy: enclosed = mean_dist high, std low (tight sphere-like pocket)
-        if mean_dist > 0:
-            concavity_score = min(1.0, max(0.0, 1.0 - (std_dist / mean_dist)))
-        else:
-            concavity_score = 0.0
+        distances = np.linalg.norm(points - centroid, axis=1)
+        mean_dist = float(np.mean(distances))
+        concavity_score = (
+            min(1.0, max(0.0, 1.0 - (float(np.std(distances)) / mean_dist)))
+            if mean_dist > 0 else 0.0
+        )
 
-        # Factor 5: Pharmacophore density (more pharmacophore features in pocket = better)
         pharm_score = min(1.0, len(pharmacophores) / 10.0)
 
-        # Weighted final score
         drugability = (
-            volume_score    * 0.30 +
-            prop_diversity  * 0.20 +
-            balance_score   * 0.20 +
-            concavity_score * 0.20 +
-            pharm_score     * 0.10
+            volume_score * 0.30
+            + prop_diversity * 0.20
+            + balance_score * 0.20
+            + concavity_score * 0.20
+            + pharm_score * 0.10
         )
         drugability = min(0.99, max(0.05, drugability))
 
         return {
             'centroid': centroid.tolist(),
             'volume': round(volume, 1),
-            'residues': res_list[:15],
+            'grid_resolution': grid_res,
+            'residues': residue_list,
             'properties': props_counts,
             'pharmacophore_points': pharmacophores,
             'drugability_score': round(drugability, 2),
-            'concavity': round(concavity_score, 2)
+            'concavity': round(concavity_score, 2),
         }
 
     def _predict_pharmacophores(self, nearby_atoms, centroid) -> List[Dict[str, Any]]:
         """
-        Predict pharmacophore features from atoms lining the pocket.
-        
-        Improvements:
-        - Aromatic centroid now computed as average of ring carbons (not just CG)
-        - Backbone acceptors/donors also included
-        """
-        points = []
-        AROMATIC_RES = {'PHE', 'TRP', 'TYR', 'HIS'}
-        AROMATIC_RING_ATOMS = {'CG', 'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CH2', 'NE1'}
+        Predict pharmacophore features from the atoms lining a pocket.
 
-        # Group aromatic residues first to compute ring centroids
-        aromatic_ring_coords = {}  # {residue_id: [coords, ...]}
+        Features are ranked before trimming to ``MAX_PHARMACOPHORES``. Backbone
+        N and O appear in every residue, so trimming in discovery order used to
+        fill the list with backbone atoms and drop the aromatic ring centroids
+        entirely — they were appended last.
+        """
+        features = []
+        aromatic_rings = {}
 
         for atom in nearby_atoms:
-            dist = np.linalg.norm(atom.get_coord() - centroid)
-            if dist > 8.5:
+            distance = float(np.linalg.norm(atom.get_coord() - centroid))
+            if distance > 8.5:
                 continue
 
-            at_name = atom.get_name().strip()
-            res = atom.get_parent()
-            res_name = res.get_resname().strip()
-            res_label = f"{res_name}{res.id[1]}"
+            name = atom.get_name().strip()
+            residue = atom.get_parent()
+            res_name = residue.get_resname().strip()
+            label = f"{res_name}{residue.id[1]}"
 
-            # H-bond Acceptors: Sidechain + backbone oxygens
-            if at_name in ['OD1', 'OD2', 'OE1', 'OE2', 'OG', 'OG1', 'OH', 'O']:
-                points.append({
-                    'type': 'ACCEPTOR',
-                    'coords': atom.get_coord().tolist(),
-                    'label': f"Acc-{res_label}"
-                })
+            if name in SIDECHAIN_ACCEPTORS:
+                features.append((PRIORITY['SIDECHAIN'], distance, {
+                    'type': 'ACCEPTOR', 'coords': atom.get_coord().tolist(),
+                    'label': f"Acc-{label}"}))
+            elif name in SIDECHAIN_DONORS:
+                features.append((PRIORITY['SIDECHAIN'], distance, {
+                    'type': 'DONOR', 'coords': atom.get_coord().tolist(),
+                    'label': f"Don-{label}"}))
+            elif name == BACKBONE_ACCEPTOR:
+                features.append((PRIORITY['BACKBONE'], distance, {
+                    'type': 'ACCEPTOR', 'coords': atom.get_coord().tolist(),
+                    'label': f"Acc-{label}(bb)"}))
+            elif name == BACKBONE_DONOR:
+                features.append((PRIORITY['BACKBONE'], distance, {
+                    'type': 'DONOR', 'coords': atom.get_coord().tolist(),
+                    'label': f"Don-{label}(bb)"}))
+            elif res_name in HYDROPHOBIC_RES and name in HYDROPHOBIC_ATOMS:
+                features.append((PRIORITY['HYDROPHOBIC'], distance, {
+                    'type': 'HYDROPHOBIC', 'coords': atom.get_coord().tolist(),
+                    'label': f"Hphob-{label}"}))
 
-            # H-bond Donors: Sidechain nitrogens + backbone NH
-            elif at_name in ['NZ', 'NH1', 'NH2', 'ND1', 'NE2', 'ND2', 'NE1', 'N']:
-                points.append({
-                    'type': 'DONOR',
-                    'coords': atom.get_coord().tolist(),
-                    'label': f"Don-{res_label}"
-                })
+            if res_name in AROMATIC_RES and name in AROMATIC_RING_ATOMS:
+                ring = aromatic_rings.setdefault(
+                    residue.get_full_id(), {'coords': [], 'label': f"Arom-{label}"})
+                ring['coords'].append(atom.get_coord())
 
-            # Hydrophobic: aliphatic residues
-            elif res_name in ['ALA', 'VAL', 'LEU', 'ILE', 'MET'] and at_name in ['CB', 'CG', 'CD', 'CE']:
-                points.append({
-                    'type': 'HYDROPHOBIC',
-                    'coords': atom.get_coord().tolist(),
-                    'label': f"Hphob-{res_label}"
-                })
+        # One feature per aromatic ring, at the true geometric centroid.
+        for ring in aromatic_rings.values():
+            if len(ring['coords']) >= 3:
+                ring_centroid = np.mean(ring['coords'], axis=0)
+                features.append((
+                    PRIORITY['AROMATIC'],
+                    float(np.linalg.norm(ring_centroid - centroid)),
+                    {'type': 'AROMATIC', 'coords': ring_centroid.tolist(),
+                     'label': ring['label']},
+                ))
 
-            # FIX: Aromatic — collect ring atom coords for centroid calculation
-            elif res_name in AROMATIC_RES and at_name in AROMATIC_RING_ATOMS:
-                rid = res.get_full_id()
-                if rid not in aromatic_ring_coords:
-                    aromatic_ring_coords[rid] = {'coords': [], 'label': f"Arom-{res_label}"}
-                aromatic_ring_coords[rid]['coords'].append(atom.get_coord())
-
-        # FIX: Now add one HYDROPHOBIC point per aromatic residue at true ring centroid
-        for rid, data in aromatic_ring_coords.items():
-            if len(data['coords']) >= 3:  # Need at least 3 ring atoms for a meaningful centroid
-                ring_centroid = np.mean(data['coords'], axis=0)
-                points.append({
-                    'type': 'HYDROPHOBIC',
-                    'coords': ring_centroid.tolist(),
-                    'label': data['label']
-                })
-
-        return points[:40]
+        features.sort(key=lambda item: (item[0], item[1]))
+        return [feature for _, _, feature in features[:MAX_PHARMACOPHORES]]

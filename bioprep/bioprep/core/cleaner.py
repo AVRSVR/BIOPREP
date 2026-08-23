@@ -7,7 +7,9 @@ class BioPrepSelect(Select):
     and restrict to specific chains without altering the base coordinate geometry.
     """
     def __init__(self, target_chains=None, remove_water=True, remove_heteroatoms=None,
-                 keep_structural_waters=False, structural_waters=None, protect_ligands=None):
+                 keep_structural_waters=False, structural_waters=None, protect_ligands=None,
+                 first_model_id=0):
+        self._first_model_id = first_model_id
         self.target_chains = target_chains if target_chains else []
         self.remove_water = remove_water
         self.remove_heteroatoms = remove_heteroatoms if remove_heteroatoms else []
@@ -15,6 +17,12 @@ class BioPrepSelect(Select):
         # Keys are (chain_id, residue.id) — residue ids repeat across chains.
         self.structural_waters = structural_waters if structural_waters else set()
         self.protect_ligands = protect_ligands if protect_ligands else []
+
+    def accept_model(self, model):
+        # Write only the first model. NMR ensembles otherwise emit every model,
+        # and the downstream tools silently use the first one anyway — so the
+        # extra models only inflate the file and the atom counts.
+        return 1 if model.id == self._first_model_id else 0
 
     def accept_chain(self, chain):
         if self.target_chains and chain.id not in self.target_chains:
@@ -69,6 +77,7 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
     This is the correct direction — protein is the reference set.
     """
     structural_waters = set()
+    first_model_id = next((model.id for model in structure), 0)
 
     if keep_structural_waters and remove_water:
         # Collect protein (standard residue) atoms as the reference set
@@ -76,6 +85,8 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
         water_residues = []
 
         for model in structure:
+            if model.id != first_model_id:
+                break  # only the first model is written out
             for chain in model:
                 if target_chains and chain.id not in target_chains:
                     continue
@@ -109,4 +120,5 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
         keep_structural_waters=keep_structural_waters,
         structural_waters=structural_waters,
         protect_ligands=protect_ligands,
+        first_model_id=first_model_id,
     )

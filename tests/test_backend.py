@@ -8,13 +8,14 @@ the bug fails with an obvious label.
 import json
 import os
 import pathlib
-import sys
+import shutil
 import tempfile
 import unittest
 
 import conftest  # noqa: F401  - sets up sys.path
 
-from bioprep.core import io, cleaner, protonator, minimizer, reporter
+from bioprep.core import (analyzer, cleaner, exporter, io, minimizer,
+                          protonator, reporter, site_analyzer)
 from bioprep.core.pipeline import PipelineSettings
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -235,6 +236,189 @@ class TestPipelineSettings(unittest.TestCase):
     def test_residue_names_normalised(self):
         s = PipelineSettings.from_mapping({'protect_ligands': [' btn ', '']})
         self.assertEqual(s.protect_ligands, ['BTN'])
+
+
+class TestAnalyzer(TempDirTest):
+
+    def _multi_model(self, models=3):
+        lines = _protein_lines()
+        path = self.path('multi.pdb')
+        with open(path, 'w') as fh:
+            for index in range(1, models + 1):
+                fh.write('MODEL     %4d\n' % index)
+                fh.writelines(lines)
+                fh.write('ENDMDL\n')
+            fh.write('END\n')
+        return path, len(lines)
+
+    def test_b10_counts_do_not_scale_with_model_count(self):
+        """B10: an NMR ensemble must not multiply atom and water counts."""
+        multi, per_model = self._multi_model(3)
+        single = _write(self.path('single.pdb'), _protein_lines())
+
+        one = analyzer.analyze_structure(io.load_pdb(single))
+        many = analyzer.analyze_structure(io.load_pdb(multi))
+
+        self.assertEqual(one['atoms_total'], many['atoms_total'])
+        self.assertEqual(many['atoms_total'], per_model)
+        self.assertEqual(many['model_count'], 3)
+
+    def test_b42_only_first_model_is_written(self):
+        """B42: saving must not emit every model of an ensemble."""
+        multi, per_model = self._multi_model(3)
+        structure = io.load_pdb(multi)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure))
+
+        written = pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+        atoms = [l for l in written if l.startswith('ATOM')]
+        self.assertEqual(len(atoms), per_model)
+
+    def test_b11_missing_residues_report_real_chain_ids(self):
+        """B11: the PDBFixer key is (chain index, position), not (model, chain)."""
+        with open(CRN) as fh:
+            seqres = [l for l in fh if l.startswith('SEQRES')]
+        kept = [l for l in _protein_lines() if not (20 <= int(l[22:26]) <= 24)]
+        source = _write(self.path('gap.pdb'), seqres + kept)
+
+        missing = analyzer.detect_missing_residues(source)
+        self.assertTrue(missing, 'no missing residues detected')
+        self.assertEqual({m['chain'] for m in missing}, {'A'})
+        for entry in missing:
+            self.assertIsInstance(entry['residue'], str)
+
+    def test_sequence_gap_detected_once(self):
+        with open(CRN) as fh:
+            seqres = [l for l in fh if l.startswith('SEQRES')]
+        kept = [l for l in _protein_lines() if not (20 <= int(l[22:26]) <= 24)]
+        source = _write(self.path('gap.pdb'), seqres + kept)
+
+        gaps = analyzer.analyze_structure(io.load_pdb(source))['sequence_gaps']
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]['missing_count'], 5)
+        self.assertEqual(gaps[0]['chain'], 'A')
+
+
+class TestSiteAnalyzer(TempDirTest):
+
+    def _protonated(self):
+        structure = io.load_pdb(CRN)
+        io.save_pdb(structure, self.path('clean.pdb'),
+                    select=cleaner.clean_structure(structure))
+        protonator.add_hydrogens(self.path('clean.pdb'), self.path('prot.pdb'))
+        return self.path('prot.pdb')
+
+    def test_b13_hydrogens_excluded_from_pocket_geometry(self):
+        """B13: pocket geometry is defined by heavy atoms."""
+        source = self._protonated()
+        total = sum(1 for l in pathlib.Path(source).read_text().splitlines()
+                    if l.startswith(('ATOM', 'HETATM')))
+
+        analyzer_obj = site_analyzer.BindingSiteAnalyzer(source)
+        self.assertLess(len(analyzer_obj.atoms), total)
+        self.assertTrue(all(a.element != 'H' for a in analyzer_obj.atoms))
+
+    def test_b12_volume_tracks_grid_resolution(self):
+        """B12: volume must use the grid actually used, not a hardcoded 1.5."""
+        import numpy as np
+        analyzer_obj = site_analyzer.BindingSiteAnalyzer(self._protonated())
+        points = np.array([[float(i), 0.0, 0.0] for i in range(100)])
+
+        fine = analyzer_obj._analyze_specific_site(points, 1.5)['volume']
+        coarse = analyzer_obj._analyze_specific_site(points, 3.0)['volume']
+        self.assertAlmostEqual(coarse / fine, 8.0, places=2)
+
+    def test_b14_aromatics_survive_a_tight_cap(self):
+        """B14: backbone N/O must yield to aromatic and sidechain features."""
+        original = site_analyzer.MAX_PHARMACOPHORES
+        site_analyzer.MAX_PHARMACOPHORES = 8
+        try:
+            analyzer_obj = site_analyzer.BindingSiteAnalyzer(self._protonated())
+            sites = analyzer_obj.analyze()
+            self.assertTrue(sites, 'no pockets found in 1CRN')
+
+            aromatic = sum(1 for s in sites for p in s['pharmacophore_points']
+                           if p['type'] == 'AROMATIC')
+            self.assertGreater(aromatic, 0,
+                               'aromatic features dropped by the feature cap')
+            for site in sites:
+                self.assertLessEqual(len(site['pharmacophore_points']), 8)
+        finally:
+            site_analyzer.MAX_PHARMACOPHORES = original
+
+    def test_empty_structure_returns_no_pockets(self):
+        source = _write(self.path('tiny.pdb'), _protein_lines()[:3])
+        self.assertEqual(site_analyzer.BindingSiteAnalyzer(source).analyze(), [])
+
+
+class TestExporter(TempDirTest):
+
+    def test_b26_gromacs_export_does_not_mangle_paths(self):
+        """B26: str.replace('.pdb') corrupts any path containing that text."""
+        nested = os.path.join(self.tmp, 'my.pdb.data')
+        os.makedirs(nested, exist_ok=True)
+        source = _write(self.path('in.pdb'), _protein_lines())
+
+        ok, result = exporter.export_structure(
+            source, os.path.join(nested, 'out.pdb'), 'gromacs')
+
+        self.assertTrue(ok)
+        self.assertIn('my.pdb.data', result)
+        self.assertTrue(os.path.isfile(result))
+
+    def test_b27_pdbqt_receptor_has_no_torsion_tree(self):
+        """B27: a receptor PDBQT must not carry ROOT/BRANCH records."""
+        if not shutil.which('obabel'):
+            self.skipTest('OpenBabel not on PATH')
+
+        structure = io.load_pdb(CRN)
+        io.save_pdb(structure, self.path('clean.pdb'),
+                    select=cleaner.clean_structure(structure))
+        protonator.add_hydrogens(self.path('clean.pdb'), self.path('prot.pdb'))
+
+        ok, result = exporter.export_structure(
+            self.path('prot.pdb'), self.path('rec.pdb'), 'vina')
+        self.assertTrue(ok, f'export failed: {result}')
+
+        text = pathlib.Path(result).read_text()
+        self.assertNotIn('ROOT', text, 'receptor was written as a torsion tree')
+        self.assertNotIn('BRANCH', text)
+        atoms = [l for l in text.splitlines() if l.startswith(('ATOM', 'HETATM'))]
+        self.assertTrue(atoms, 'receptor has no atom records')
+
+    def test_missing_obabel_is_reported_not_raised(self):
+        """A missing OpenBabel must return a message, not blow up the request."""
+        import subprocess as _subprocess
+
+        def explode(*args, **kwargs):
+            raise FileNotFoundError('obabel')
+
+        original = _subprocess.run
+        exporter.subprocess.run = explode
+        try:
+            ok, message = exporter.convert_to_pdbqt('in.pdb', 'out.pdbqt')
+        finally:
+            exporter.subprocess.run = original
+
+        self.assertFalse(ok)
+        self.assertIn('OpenBabel', message)
+
+    def test_obabel_nonzero_exit_is_reported(self):
+        import subprocess as _subprocess
+
+        class Result:
+            returncode = 1
+            stderr = 'something went wrong'
+
+        original = _subprocess.run
+        exporter.subprocess.run = lambda *a, **k: Result()
+        try:
+            ok, message = exporter.convert_to_pdbqt('in.pdb', 'out.pdbqt')
+        finally:
+            exporter.subprocess.run = original
+
+        self.assertFalse(ok)
+        self.assertIn('something went wrong', message)
 
 
 if __name__ == '__main__':
