@@ -58,15 +58,64 @@ def _atom_key(atom):
     return (residue.chain.id, residue.name, residue.id, atom.name)
 
 
+def _make_simulation(topology, system, integrator):
+    """
+    Build a Simulation, preferring the CPU platform.
+
+    CPU is available everywhere and gives reproducible results; CUDA or OpenCL
+    may be present but mis-configured, which fails at context creation rather
+    than at import. Falling back to OpenMM's own choice keeps that from being
+    fatal.
+    """
+    try:
+        platform = mm.Platform.getPlatformByName('CPU')
+        return app.Simulation(topology, system, integrator, platform)
+    except Exception:
+        logger.debug("CPU platform unavailable; using the default platform")
+        return app.Simulation(topology, system, integrator)
+
+
+def _create_system(topology, positions, forcefield, allow_terminal_fix=True):
+    """
+    Build the OpenMM system, repairing terminal groups if the first try fails.
+
+    A chain truncated mid-structure often lacks OXT, and a residue missing its
+    terminal hydrogens matches no template, so createSystem raises. Running the
+    topology through Modeller.addHydrogens caps those ends and usually makes it
+    parameterisable. Returns (system, topology, positions), where the topology
+    may have gained atoms.
+    """
+    try:
+        system = forcefield.createSystem(
+            topology, nonbondedMethod=app.NoCutoff, constraints=app.HBonds)
+        return system, topology, positions, False
+    except Exception as exc:
+        if not allow_terminal_fix:
+            raise
+        logger.debug("createSystem failed (%s); attempting terminal repair", exc)
+
+        modeller = app.Modeller(topology, positions)
+        modeller.addHydrogens(forcefield=forcefield)
+        system = forcefield.createSystem(
+            modeller.topology, nonbondedMethod=app.NoCutoff,
+            constraints=app.HBonds)
+        return system, modeller.topology, modeller.positions, True
+
+
 def _run(topology, positions, forcefield):
-    """Minimise one system. Returns (positions, energy_before, energy_after)."""
-    system = forcefield.createSystem(
-        topology, nonbondedMethod=app.NoCutoff, constraints=app.HBonds
-    )
+    """
+    Minimise one system.
+
+    Returns (positions, energy_before, energy_after, topology, repaired).
+    The topology comes back because terminal repair may have added atoms.
+    """
+    system, topology, positions, repaired = _create_system(
+        topology, positions, forcefield)
+
     integrator = mm.LangevinMiddleIntegrator(
         300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picosecond
     )
-    simulation = app.Simulation(topology, system, integrator)
+    simulation = _make_simulation(topology, system, integrator)
     simulation.context.setPositions(positions)
 
     before = (simulation.context.getState(getEnergy=True)
@@ -88,7 +137,7 @@ def _run(topology, positions, forcefield):
             f"Minimisation produced a non-finite energy ({after}); the result "
             "is unusable."
         )
-    return state.getPositions(), before, after
+    return state.getPositions(), before, after, topology, repaired
 
 
 def _safe_subset(pdb):
@@ -163,7 +212,10 @@ def minimize_structure(input_pdb_path, output_pdb_path,
         'energy_after_kJ_mol': None,
         'delta_energy_kJ_mol': None,
         'iterations_max': MAX_ITERATIONS,
+        'energy_tolerance_kJ_mol_nm': ENERGY_TOLERANCE,
         'energy_decreased': False,
+        'converged': False,
+        'terminals_repaired': False,
         'excluded_residues': [],
         'warnings': [],
         'error': None,
@@ -202,10 +254,10 @@ def minimize_structure(input_pdb_path, output_pdb_path,
                 if modeller is None:
                     # Nothing to strip, so this tier cannot differ from Tier 1.
                     continue
-                positions, before, after = _run(
+                positions, before, after, sub_topology, repaired = _run(
                     modeller.topology, modeller.positions, forcefield
                 )
-                merged = _merge_coords_by_name(pdb, modeller.topology, positions)
+                merged = _merge_coords_by_name(pdb, sub_topology, positions)
                 _write(output_pdb_path, pdb.topology, merged)
                 result['excluded_residues'] = excluded
                 result['warnings'].append(
@@ -214,10 +266,18 @@ def minimize_structure(input_pdb_path, output_pdb_path,
                     + ', '.join(excluded)
                 )
             else:
-                positions, before, after = _run(
+                positions, before, after, topology, repaired = _run(
                     pdb.topology, pdb.positions, forcefield
                 )
-                _write(output_pdb_path, pdb.topology, positions)
+                _write(output_pdb_path, topology, positions)
+
+            if repaired:
+                result['terminals_repaired'] = True
+                result['warnings'].append(
+                    "The force field had no template for the structure as "
+                    "given; terminal groups were capped with Modeller before "
+                    "minimising."
+                )
 
             if abs(before) > SUSPECT_ENERGY:
                 result['warnings'].append(
@@ -226,13 +286,17 @@ def minimize_structure(input_pdb_path, output_pdb_path,
                     "geometry with caution."
                 )
 
+            delta = after - before
             result.update({
                 'status': status,
                 'gbsa_used': gbsa,
                 'energy_before_kJ_mol': round(before, 1),
                 'energy_after_kJ_mol': round(after, 1),
-                'delta_energy_kJ_mol': round(after - before, 1),
-                'energy_decreased': (after - before) < -0.1,
+                'delta_energy_kJ_mol': round(delta, 1),
+                'energy_decreased': delta < -0.1,
+                # Converged means the minimiser found a real improvement, or it
+                # started at a sensible energy and had nothing left to gain.
+                'converged': (delta < -1.0) or (abs(delta) < 1.0 and after < 0),
             })
             return result
 

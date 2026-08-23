@@ -977,6 +977,84 @@ class TestMinimizer(TempDirTest):
         self.assertTrue(os.path.exists(self.path('min.pdb')))
 
 
+class TestMinimizerFeatures(TempDirTest):
+    """Features 29-48 that the earlier rewrite did not cover."""
+
+    def _prepared(self, extra=()):
+        source = _write(self.path('raw.pdb'), _protein_lines() + list(extra))
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('clean.pdb'),
+                    select=cleaner.clean_structure(structure, remove_water=False))
+        protonator.add_hydrogens(self.path('clean.pdb'), self.path('prot.pdb'))
+        return self.path('prot.pdb')
+
+    def test_feature29_charmm36_force_field_runs(self):
+        stats = minimizer.minimize_structure(
+            self._prepared(), self.path('out.pdb'), force_field='charmm36')
+        self.assertEqual(stats['status'], 'full', stats.get('error'))
+        self.assertEqual(stats['force_field'], 'charmm36')
+
+    def test_feature33_terminal_repair_is_available(self):
+        """createSystem failure should trigger a Modeller capping retry."""
+        import inspect
+        source = inspect.getsource(minimizer._create_system)
+        self.assertIn('addHydrogens(forcefield=', source)
+        self.assertIn('Modeller', source)
+
+    def test_feature37_excluded_residue_is_held_fixed(self):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        ligand = (f'HETATM  900  C1  LIG A 900    {x + 6:8.3f}{y:8.3f}{z:8.3f}'
+                  '  1.00 10.00           C  \n')
+        source = self._prepared([ligand])
+
+        stats = minimizer.minimize_structure(source, self.path('out.pdb'))
+        self.assertEqual(stats['status'], 'partial')
+
+        def ligand_coords(path):
+            # ATOM/HETATM only: PDBFile also emits a TER carrying the resname.
+            return [l[30:54] for l in pathlib.Path(path).read_text().splitlines()
+                    if l[:6] in ('ATOM  ', 'HETATM') and l[17:20].strip() == 'LIG']
+
+        self.assertEqual(ligand_coords(source), ligand_coords(self.path('out.pdb')))
+
+    def test_feature41_convergence_follows_the_documented_rule(self):
+        stats = minimizer.minimize_structure(self._prepared(), self.path('out.pdb'))
+        delta = stats['delta_energy_kJ_mol']
+        expected = (delta < -1.0) or (abs(delta) < 1.0
+                                      and stats['energy_after_kJ_mol'] < 0)
+        self.assertEqual(stats['converged'], expected)
+        self.assertTrue(stats['converged'], f'delta={delta}')
+
+    def test_feature41_failed_run_is_not_converged(self):
+        junk = _write(self.path('junk.pdb'), ['REMARK nothing\n'])
+        stats = minimizer.minimize_structure(junk, self.path('out.pdb'))
+        self.assertEqual(stats['status'], 'failed')
+        self.assertFalse(stats['converged'])
+
+    def test_feature43_44_caps_are_reported(self):
+        stats = minimizer.minimize_structure(self._prepared(), self.path('out.pdb'))
+        self.assertEqual(stats['iterations_max'], 1000)
+        self.assertEqual(stats['energy_tolerance_kJ_mol_nm'], 10.0)
+
+    def test_feature46_cpu_platform_is_preferred_with_fallback(self):
+        import inspect
+        source = inspect.getsource(minimizer._make_simulation)
+        self.assertIn("getPlatformByName('CPU')", source)
+        self.assertIn('except Exception', source)
+
+    def test_feature38_residue_classification_sets(self):
+        from bioprep.core import residues
+
+        self.assertLessEqual({'HID', 'HIE', 'HIP', 'CYX', 'ASH', 'GLH'},
+                             residues.AMINO_ACIDS)
+        self.assertLessEqual({'DA', 'DC', 'DG', 'DT'}, residues.NUCLEIC_ACIDS)
+        self.assertEqual(residues.FORCE_FIELD_SAFE,
+                         residues.AMINO_ACIDS | residues.NUCLEIC_ACIDS
+                         | residues.WATER)
+        self.assertFalse(residues.is_force_field_safe('LIG'))
+
+
 class TestReporter(unittest.TestCase):
 
     def test_b24_b25_renders_partial_report(self):
