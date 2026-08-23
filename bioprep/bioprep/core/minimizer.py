@@ -34,8 +34,20 @@ SUSPECT_ENERGY = 1.0e12          # kJ/mol — beyond this, geometry is suspect
 # Tier 2 deletes the residues no force field can parameterise, which leaves the
 # site they occupied empty. These hold the surrounding atoms near their input
 # positions so the site cannot relax inward while its occupant is missing.
+# Chosen by measurement on streptavidin with biotin deleted, against an input
+# closest protein-ligand contact of 2.58 A:
+#
+#   k        closest   lining atoms      worst      final energy
+#            contact   moving inward     inward     (kJ/mol)
+#   0        2.17 A    27 of 67          -0.63 A    -15117
+#   500      2.37 A    23 of 67          -0.40 A    -15012
+#   5000     2.45 A     7 of 67          -0.18 A    -14683
+#
+# 5000 nearly removes the collapse for about three percent less energy
+# reduction, which is the better trade: the point of the tier is to relieve
+# strain, not to let the site close on an absent ligand.
 POCKET_RESTRAINT_CUTOFF = 5.0    # angstrom around a deleted residue
-POCKET_RESTRAINT_K = 500.0       # kJ/mol/nm^2 applied to those atoms
+POCKET_RESTRAINT_K = 5000.0      # kJ/mol/nm^2 applied to those atoms
 
 STATUS_FULL = 'full'
 STATUS_PARTIAL = 'partial'
