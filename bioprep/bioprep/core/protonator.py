@@ -172,6 +172,7 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
         'ligands_preserved': [],
         'ligand_status': [],
         'nonstandard_replaced': [],
+        'terminals_repaired': 0,
         'loops_reconstructed': 0,
         'warnings': [],
     }
@@ -238,9 +239,27 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
             )
             fixer.replaceNonstandardResidues()
 
-        if add_missing_atoms or reconstruct_loops:
-            fixer.findMissingAtoms()
-            fixer.addMissingAtoms()
+        fixer.findMissingAtoms()
+
+        # A terminal OXT is not optional modelling. Without it the last residue
+        # matches no force-field template, so createSystem fails and the whole
+        # structure falls through every minimisation tier - which is what
+        # happens to any crystal structure deposited without a capped terminus.
+        # Rebuilding absent side chains is a modelling choice and stays behind
+        # the flag, so when the flag is off the sidechain list is cleared and
+        # only the terminals are added.
+        terminal_atoms = sum(len(v) for v in fixer.missingTerminals.values())
+        if not (add_missing_atoms or reconstruct_loops):
+            fixer.missingAtoms = {}
+
+        result['terminals_repaired'] = terminal_atoms
+        if terminal_atoms:
+            result['warnings'].append(
+                f"Added {terminal_atoms} missing terminal atom(s); the input "
+                "chain ended without one and would not have parameterised."
+            )
+
+        fixer.addMissingAtoms()
 
         try:
             fixer.addMissingHydrogens(ph)

@@ -35,6 +35,35 @@ MAX_PHARMACOPHORES = 40
 MIN_POCKET_VOLUME = 50.0
 MAX_POCKETS = 5
 
+
+def _enclosure_directions():
+    """
+    The directions the enclosure test scans, as unit vectors.
+
+    LIGSITE scans seven axes - the three Cartesian axes plus the four cubic
+    body diagonals - in both senses, giving fourteen rays. Scanning only the
+    six axis-aligned rays makes the result depend on how the molecule happens
+    to be oriented in the file: the same cavity, rotated, is sampled by rays
+    that meet its walls at different angles. Measured on streptavidin, a 45
+    degree rotation changed total detected cavity volume by nearly half.
+    """
+    directions = []
+    for axis in np.eye(3):
+        directions.extend([axis, -axis])
+    for signs in ((1, 1, 1), (1, 1, -1), (1, -1, 1), (-1, 1, 1)):
+        diagonal = np.array(signs, dtype=float)
+        diagonal /= np.linalg.norm(diagonal)
+        directions.extend([diagonal, -diagonal])
+    return np.array(directions)
+
+
+ENCLOSURE_DIRECTIONS = _enclosure_directions()      # 14 rays over 7 axes
+
+#: A point counts as enclosed when this fraction of the rays is blocked.
+#: Half matches the previous 3-of-6 behaviour on the axis-aligned subset.
+ENCLOSURE_FRACTION = 0.5
+MIN_BLOCKED_DIRECTIONS = int(round(len(ENCLOSURE_DIRECTIONS) * ENCLOSURE_FRACTION))
+
 # Feature ranking used when trimming to MAX_PHARMACOPHORES. Sidechain and
 # aromatic features characterise a pocket; backbone N/O occur in every residue
 # and would otherwise crowd everything else out of the list.
@@ -166,7 +195,9 @@ class BindingSiteAnalyzer:
 
         enclosed = []
         max_dist = 12.0
-        directions = [(0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)]
+        directions = ENCLOSURE_DIRECTIONS
+        needed = MIN_BLOCKED_DIRECTIONS
+        remaining_after = len(directions) - np.arange(len(directions)) - 1
 
         for i, point in enumerate(candidates):
             neighbours = neighbour_lists[i]
@@ -177,17 +208,22 @@ class BindingSiteAnalyzer:
             dist_sq = np.sum(vectors ** 2, axis=1)
 
             hits = 0
-            for axis, sign in directions:
-                projections = vectors[:, axis] * sign
+            for index, direction in enumerate(directions):
+                # General projection onto a unit vector, so a diagonal ray is
+                # measured the same way an axis-aligned one is.
+                projections = vectors @ direction
                 # Perpendicular distance from the ray, via Pythagoras.
                 perpendicular_sq = dist_sq - projections ** 2
                 blocked = ((projections > 1.5) & (projections < max_dist)
                            & (perpendicular_sq < 6.25))
                 if np.any(blocked):
                     hits += 1
-                    if hits >= 3:
+                    if hits >= needed:
                         enclosed.append(point)
                         break
+                elif hits + remaining_after[index] < needed:
+                    # Cannot reach the threshold with the rays that are left.
+                    break
 
         if not enclosed:
             return [], grid_res
