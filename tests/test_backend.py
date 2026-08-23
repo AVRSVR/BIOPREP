@@ -104,6 +104,123 @@ class TestIO(TempDirTest):
             io.load_pdb(cif)
 
 
+class TestSavePdb(TempDirTest):
+    """Features 3 and 4: PDBIO saving, and saving through a Select filter."""
+
+    METALS = [
+        'HETATM  900 ZN    ZN A 300      12.000  12.000  12.000  1.00 10.00          ZN  \n',
+        'HETATM  901 MG    MG A 301      16.000  12.000  12.000  1.00 10.00          MG  \n',
+        'HETATM  902 FE    FE A 302      20.000  12.000  12.000  1.00 10.00          FE  \n',
+        'HETATM  903 CL    CL A 303      24.000  12.000  12.000  1.00 10.00          CL  \n',
+    ]
+
+    def test_feature3_element_column_matches_the_spec(self):
+        """
+        Biopython writes column 67 onward one place early, which truncates
+        two-character element symbols. Compare against a real RCSB line.
+        """
+        structure = io.load_pdb(CRN)
+        io.save_pdb(structure, self.path('out.pdb'))
+
+        rcsb = next(l.rstrip('\n') for l in pathlib.Path(CRN).read_text().splitlines()
+                    if l.startswith('ATOM'))
+        ours = next(l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                    if l.startswith('ATOM'))
+
+        self.assertEqual(len(ours), 80, 'line is not 80 columns')
+        self.assertEqual(ours[76:78], rcsb[76:78],
+                         'element column does not match the reference file')
+
+    def test_feature3_two_character_metals_round_trip(self):
+        """ZN must not come back as N, nor FE as F."""
+        source = _write(self.path('metals.pdb'), _protein_lines() + self.METALS)
+
+        original = io.load_pdb(source)
+        expected = {a.get_parent().get_resname().strip(): a.element
+                    for a in original.get_atoms() if a.get_parent().id[0] != ' '}
+        io.save_pdb(original, self.path('out.pdb'))
+
+        reloaded = {a.get_parent().get_resname().strip(): a.element
+                    for a in io.load_pdb(self.path('out.pdb')).get_atoms()
+                    if a.get_parent().id[0] != ' '}
+
+        self.assertEqual(expected, reloaded)
+        self.assertEqual(reloaded.get('ZN'), 'ZN')
+        self.assertEqual(reloaded.get('FE'), 'FE')
+
+    def test_feature3_openmm_reads_metals_from_our_output(self):
+        """The downstream consumer must agree; OpenMM read ZN as N before."""
+        from openmm.app import PDBFile
+
+        source = _write(self.path('metals.pdb'), _protein_lines() + self.METALS)
+        io.save_pdb(io.load_pdb(source), self.path('out.pdb'))
+
+        symbols = {
+            atom.residue.name.strip(): (atom.element.symbol if atom.element else None)
+            for atom in PDBFile(self.path('out.pdb')).topology.atoms()
+            if atom.residue.name.strip() in ('ZN', 'MG', 'FE', 'CL')
+        }
+        self.assertEqual(symbols,
+                         {'ZN': 'Zn', 'MG': 'Mg', 'FE': 'Fe', 'CL': 'Cl'})
+
+    def test_feature3_preserves_occupancy_bfactor_altloc_icode(self):
+        rows = [
+            'ATOM      1  N   ALA A   1       1.000   2.000   3.000  0.75 12.34           N  \n',
+            'ATOM      2  CA AALA A  50      10.000  10.000  10.000  0.50 20.00           C  \n',
+            'ATOM      3  CA BALA A  50      10.500  10.000  10.000  0.50 20.00           C  \n',
+            'ATOM      4  N   GLY A  51A     11.000  11.000  11.000  1.00 15.00           N  \n',
+        ]
+        source = _write(self.path('in.pdb'), rows)
+        io.save_pdb(io.load_pdb(source), self.path('out.pdb'))
+
+        written = [l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                   if l.startswith('ATOM')]
+        self.assertEqual(len(written), 4)
+
+        first = next(l for l in written if l[22:26].strip() == '1')
+        self.assertEqual(first[54:60].strip(), '0.75')
+        self.assertEqual(first[60:66].strip(), '12.34')
+
+        self.assertEqual({l[16] for l in written if l[22:26].strip() == '50'},
+                         {'A', 'B'})
+        self.assertTrue(any(l[26] == 'A' for l in written
+                            if l[22:26].strip() == '51'))
+
+    def test_feature3_creates_missing_parent_directories(self):
+        io.save_pdb(io.load_pdb(CRN), self.path('a/b/c/out.pdb'))
+        self.assertTrue(os.path.isfile(self.path('a/b/c/out.pdb')))
+
+    def test_feature4_select_filters_what_is_written(self):
+        from Bio.PDB import Select
+
+        source = _write(self.path('in.pdb'), _protein_lines() + self.METALS)
+        structure = io.load_pdb(source)
+
+        class ProteinOnly(Select):
+            def accept_residue(self, residue):
+                return 1 if residue.id[0] == ' ' else 0
+
+        io.save_pdb(structure, self.path('out.pdb'), select=ProteinOnly())
+        text = pathlib.Path(self.path('out.pdb')).read_text()
+
+        for metal in ('ZN', 'MG', 'FE'):
+            self.assertNotIn(metal, text)
+        self.assertTrue(any(l.startswith('ATOM') for l in text.splitlines()))
+
+    def test_feature4_select_rejecting_everything_still_writes_a_file(self):
+        from Bio.PDB import Select
+
+        class RejectAll(Select):
+            def accept_residue(self, residue):
+                return 0
+
+        io.save_pdb(io.load_pdb(CRN), self.path('empty.pdb'), select=RejectAll())
+        self.assertTrue(os.path.isfile(self.path('empty.pdb')))
+        text = pathlib.Path(self.path('empty.pdb')).read_text()
+        self.assertEqual([l for l in text.splitlines()
+                          if l.startswith(('ATOM', 'HETATM'))], [])
+
+
 class TestMmcifSupport(TempDirTest):
     """mmCIF input: RCSB serves it by default, so it must be accepted."""
 

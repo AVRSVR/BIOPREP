@@ -193,6 +193,45 @@ def ensure_pdb(input_path, workdir=None):
     return output_path, 'mmcif'
 
 
+class SpecCompliantPDBIO(PDBIO):
+    """
+    PDBIO that puts the element symbol where the PDB specification puts it.
+
+    Biopython's ``_ATOM_FORMAT_STRING`` places five spaces between the
+    B-factor and the segment identifier where the format requires six, so
+    every field from column 67 onward is written one column early. The
+    element then straddles the boundary: a reader taking columns 77-78 sees
+    the symbol's second character followed by a blank.
+
+    Single-character elements survive by luck. Two-character metals do not,
+    and the failure is silent whenever the leftover character is itself a
+    valid symbol - ZN reads back as nitrogen, FE as fluorine. Both Biopython
+    and OpenMM reproduce that, which matters for any structure containing a
+    metal cofactor.
+    """
+
+    def _get_atom_line(self, atom, hetfield, segid, atom_number, resname,
+                       resseq, icode, chain_id, charge="  "):
+        line = super()._get_atom_line(atom, hetfield, segid, atom_number,
+                                      resname, resseq, icode, chain_id, charge)
+
+        # Only coordinate records carry an element column.
+        if not line.startswith(("ATOM  ", "HETATM")):
+            return line
+
+        # Columns 1-66 (x, y, z, occupancy, B-factor) already match the spec;
+        # rebuild everything after them.
+        element = (atom.element or "").strip().upper()
+        return (
+            f"{line[:66]}"
+            f"{'':6}"        # columns 67-72, blank
+            f"{segid:<4}"    # columns 73-76, segment identifier
+            f"{element:>2}"  # columns 77-78, element, right-justified
+            f"{charge:>2}"   # columns 79-80, formal charge
+            "\n"
+        )
+
+
 def save_pdb(structure, output_path, select=None):
     """
     Save a Biopython Structure to a PDB file.
@@ -202,7 +241,11 @@ def save_pdb(structure, output_path, select=None):
         output_path (str): Path to write the PDB file.
         select (Select, optional): Biopython Select used to filter atoms.
     """
-    io = PDBIO()
+    parent = os.path.dirname(os.path.abspath(output_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    io = SpecCompliantPDBIO()
     io.set_structure(structure)
     if select:
         io.save(output_path, select)
