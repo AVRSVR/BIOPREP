@@ -1413,3 +1413,35 @@ input[type="range"]::-webkit-slider-thumb:hover {
 .hidden {
     display: none !important;
 }
+
+/* Warnings panel: the pipeline records things the user needs to know about
+   the result - a ligand held at its input coordinates, a repaired terminus,
+   a suspicious starting energy - and nothing used to display them. */
+.warnings-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.warnings-list li {
+    position: relative;
+    padding: 0.6rem 0.8rem 0.6rem 2rem;
+    border-radius: 8px;
+    background: rgba(255, 176, 32, 0.08);
+    border-left: 3px solid var(--amber, #ffb020);
+    font-size: 0.85rem;
+    line-height: 1.45;
+    color: var(--text-secondary, #b8c0cc);
+}
+
+.warnings-list li::before {
+    content: "!";
+    position: absolute;
+    left: 0.85rem;
+    top: 0.6rem;
+    font-weight: 700;
+    color: var(--amber, #ffb020);
+}

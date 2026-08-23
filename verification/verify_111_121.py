@@ -237,17 +237,37 @@ report_fields_used = set(re.findall(r"report\.([a-zA-Z_]+)", js))
 check(117, "frontend reads report fields", bool(report_fields_used),
       str(sorted(report_fields_used))[:70])
 
-CONTRACT = {
-    "report.protonation.hydrogens_added": "protonation" in js,
-    "report.energy_minimization.status": "energy_minimization" in js,
-    "report.warnings": "warnings" in js,
-}
+# Strip comments before looking for stale field names, or the notes that
+# explain the change are themselves read as evidence of the old code.
+js_code = re.sub(r"//[^\n]*", "", js)
+js_code = re.sub(r"/\*.*?\*/", "", js_code, flags=re.S)
+
 stale = []
-for key in ("potential_energy_before", "iterations", "'N/A'"):
-    if key in js:
-        stale.append(key)
-check(117, "frontend has no references to removed energy fields",
-      not stale, f"stale references: {stale}")
+if re.search(r"\bem\.iterations\b(?!_max)", js_code):
+    stale.append("em.iterations (now iterations_max)")
+if re.search(r"[!=]==?\s*['\"]N/A['\"]", js_code):
+    stale.append("comparison against the string 'N/A' (energies are null now)")
+if "potential_energy_before" in js_code:
+    stale.append("potential_energy_before")
+check(117, "frontend reads no removed energy fields", not stale,
+      f"stale: {stale}")
+
+# and it must read what the backend now reports
+CONTRACT = {
+    "protonation.hydrogens_added": "hydrogens_added" in js_code,
+    "energy_minimization.status": "em.status" in js_code,
+    "energy_minimization.iterations_max": "iterations_max" in js_code,
+    "energy_minimization.rms_force_kJ_mol_nm": "rms_force_kJ_mol_nm" in js_code,
+    "energy_minimization.excluded_residues": "excluded_residues" in js_code,
+    "report.warnings": "report.warnings" in js_code,
+    "water_molecules_retained": "water_molecules_retained" in js_code,
+    "protonation.ligands_preserved": "ligands_preserved" in js_code,
+}
+for field, present in CONTRACT.items():
+    check(117, f"frontend reads {field}", present, "missing")
+
+check(117, "hydrogens are reported, not asserted",
+      "hydrogens: true" not in js_code, "still hardcoded true")
 
 
 # ---- report ----------------------------------------------------------------
@@ -267,4 +287,4 @@ print("=" * 84)
 print(f"{len(RESULTS)} checks across features 111-121, {failed} failed")
 print()
 print("frontend report fields referenced:", sorted(report_fields_used))
-print("backend contract present in js:", {k: v for k, v in CONTRACT.items()})
+print("backend contract present in js:", {k: v for k, v in CONTRACT.items() if not v} or "all present")

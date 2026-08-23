@@ -52,6 +52,7 @@ def build_report(
             "ligand_status": protonation.get("ligand_status", []),
             "nonstandard_replaced": protonation.get("nonstandard_replaced", []),
             "loops_reconstructed": protonation.get("loops_reconstructed", 0),
+            "terminals_repaired": protonation.get("terminals_repaired", 0),
         },
         # Kept at the top level for backwards compatibility with older readers.
         "hydrogens_added": protonation.get("hydrogens_added", False),
@@ -130,6 +131,7 @@ def report_to_text(report):
         f"  Ligands Protected : {_join(protonation.get('ligands_preserved'))}",
         f"  Nonstandard Fixed : {_join(protonation.get('nonstandard_replaced'))}",
         f"  Loops Rebuilt     : {protonation.get('loops_reconstructed', 0)}",
+        f"  Terminals Repaired: {protonation.get('terminals_repaired', 0)}",
     ]
 
     # Explain the protected ligands rather than just naming them: coming out

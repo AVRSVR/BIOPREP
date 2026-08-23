@@ -51,9 +51,17 @@ def _split_records(pdb_path):
     write, so keeping later models would weld an NMR ensemble into a single
     chimeric protein with every residue repeated once per model.
 
-    Returns (biopolymer_lines, ligand_lines, conect_lines).
+    Waters are returned separately from the polymer so a TER can be written
+    between them. Crystallographic waters usually carry the same chain id as
+    the protein; with no TER, PDBFixer reads them as a continuation of that
+    chain, the last amino acid is no longer the chain's end, and no terminal
+    OXT is added. The structure is then unparameterisable and every
+    minimisation tier fails - which is what happened to 1STP whenever
+    structural waters were kept.
+
+    Returns (polymer_lines, water_lines, ligand_lines, conect_lines).
     """
-    biopolymer, ligand, conect = [], [], []
+    biopolymer, waters, ligand, conect = [], [], [], []
     ligand_serials = set()
     past_first_model = False
 
@@ -66,12 +74,9 @@ def _split_records(pdb_path):
 
             if record in ('ATOM  ', 'HETATM'):
                 resname = line[17:20].strip()
-                keep_with_protein = (
-                    record == 'ATOM  '
-                    or is_standard(resname)
-                    or is_water(resname)
-                )
-                if keep_with_protein:
+                if is_water(resname):
+                    waters.append(line)
+                elif record == 'ATOM  ' or is_standard(resname):
                     biopolymer.append(line)
                 else:
                     ligand.append(line)
@@ -83,12 +88,18 @@ def _split_records(pdb_path):
             elif record == 'CONECT':
                 conect.append(line)
 
-            elif record == 'ENDMDL':
+            elif record.strip() == 'ENDMDL':
                 # Everything past here belongs to a later model.
                 past_first_model = True
 
-            elif record in ('TER   ', 'END   ', 'MODEL '):
+            elif record.strip() in ('TER', 'END', 'MODEL'):
                 # Structural records are regenerated on write; drop them.
+                # Compared after stripping: a real file writes 'END' as three
+                # characters, which never matched the padded 'END   ' this
+                # once tested for. The record then fell through into the
+                # biopolymer list, and once waters were split out it landed
+                # ahead of them - so the file handed to PDBFixer ended before
+                # its own waters and every one of them was silently dropped.
                 continue
             else:
                 # SEQRES, HELIX, CRYST1 etc. must reach PDBFixer — it uses
@@ -100,7 +111,7 @@ def _split_records(pdb_path):
         c for c in conect
         if any(s in ligand_serials for s in _conect_serials(c))
     ]
-    return biopolymer, ligand, ligand_conect
+    return biopolymer, waters, ligand, ligand_conect
 
 
 def _conect_serials(line):
@@ -199,7 +210,8 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
         'warnings': [],
     }
 
-    biopolymer, ligand_lines, ligand_conect = _split_records(input_pdb_path)
+    biopolymer, water_lines, ligand_lines, ligand_conect = _split_records(
+        input_pdb_path)
 
     # Record not just which ligands were held back but why, so the preparation
     # report can explain an otherwise surprising result: the ligand comes out
@@ -237,6 +249,14 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
     try:
         with open(protein_only, 'w') as fh:
             fh.writelines(biopolymer)
+            if water_lines:
+                # A TER, or PDBFixer reads the waters as a continuation of the
+                # protein chain: the last amino acid stops being the chain's
+                # end, no terminal OXT is added, and the structure will not
+                # parameterise. That silently broke minimisation for any
+                # structure processed with structural waters kept.
+                fh.write('TER\n')
+                fh.writelines(water_lines)
             fh.write('END\n')
 
         # PDBFixer(filename=...) closes its handle only on the success path —

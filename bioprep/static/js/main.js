@@ -561,12 +561,20 @@ document.addEventListener('DOMContentLoaded', () => {
         const hets = report.heteroatoms;
 
         grid.innerHTML = '';
+        // Reported by the protonator rather than assumed. The old markup
+        // stated hydrogens were added whether or not they were.
+        const prot = report.protonation || {};
+        const hydrogensAdded = prot.hydrogens_added !== undefined
+            ? prot.hydrogens_added : report.hydrogens_added;
+
         const items = [
-            { label: 'Chains Detected', val: chains.detected.join(', ') || 'N/A' },
-            { label: 'Chains Retained', val: chains.retained.join(', ') || 'N/A' },
+            { label: 'Chains Detected', val: chains.detected.join(', ') || 'None' },
+            { label: 'Chains Retained', val: chains.retained.join(', ') || 'None' },
             { label: 'Waters Removed', val: report.water_molecules_removed },
+            { label: 'Waters Retained', val: report.water_molecules_retained || 0 },
             { label: 'Heteroatoms Removed', val: hets.removed.join(', ') || 'None' },
             { label: 'Ligands Retained', val: hets.retained.join(', ') || 'None' },
+            { label: 'Hydrogens Added', val: hydrogensAdded ? '✅ Yes' : '❌ No' },
             { label: 'Target pH', val: report.protonation_ph },
             { label: 'Missing Residues', val: report.missing_residues_detected.length },
             { label: 'Atoms Before', val: ac.before_processing },
@@ -574,6 +582,25 @@ document.addEventListener('DOMContentLoaded', () => {
             { label: 'Atom Delta', val: (ac.delta >= 0 ? '+' : '') + ac.delta },
             { label: 'Processing Time', val: `${report.processing_time_seconds}s` },
         ];
+
+        if (prot.ligands_preserved && prot.ligands_preserved.length) {
+            items.push({
+                label: 'Ligands Protected',
+                val: prot.ligands_preserved.join(', '),
+            });
+        }
+        if (prot.loops_reconstructed) {
+            items.push({ label: 'Loops Rebuilt', val: prot.loops_reconstructed });
+        }
+        if (prot.terminals_repaired) {
+            items.push({ label: 'Terminals Repaired', val: prot.terminals_repaired });
+        }
+        if (prot.nonstandard_replaced && prot.nonstandard_replaced.length) {
+            items.push({
+                label: 'Nonstandard Replaced',
+                val: prot.nonstandard_replaced.join(', '),
+            });
+        }
         items.forEach(({ label, val }) => {
             const div = document.createElement('div');
             div.className = 'report-item';
@@ -589,7 +616,7 @@ document.addEventListener('DOMContentLoaded', () => {
             `ph: ${report.protonation_ph}`,
             `chains: [${chains.retained.join(',')}]`,
             `removed_hets: [${hets.removed.join(',')}]`,
-            `hydrogens: true`,
+            `hydrogens: ${!!hydrogensAdded}`,
         ];
         if (report.energy_minimization) tags.push(`force_field: ${report.energy_minimization.force_field}`);
         if (report.docking_target) tags.push(`docking: ${report.docking_target}`);
@@ -617,13 +644,47 @@ document.addEventListener('DOMContentLoaded', () => {
                                <div class="ri-val" style="font-size: 0.85rem; white-space: normal;">${em.error}</div>`;
                 miniGrid.appendChild(d);
             } else {
+                // Energies are numbers or null now, never the string 'N/A'.
+                const kJ = (v) => (v === null || v === undefined)
+                    ? 'not run' : `${v} kJ/mol`;
+
+                // status is the field that matters: a returned file is not
+                // proof that minimization ran. 'partial' means some residues
+                // were held at their input coordinates.
+                const STATUS_LABEL = {
+                    full: 'Full structure',
+                    partial: 'Partial — some residues held fixed',
+                    partial_no_implicit_solvent: 'Partial, no implicit solvent',
+                    failed: 'Did not run',
+                };
+
                 const miniItems = [
+                    { label: 'Status', val: STATUS_LABEL[em.status] || em.status },
                     { label: 'Force Field', val: em.force_field },
-                    { label: 'Energy Before', val: `${em.energy_before_kJ_mol} kJ/mol` },
-                    { label: 'Energy After', val: `${em.energy_after_kJ_mol} kJ/mol` },
-                    { label: 'Iterations', val: em.iterations },
-                    { label: 'Converged', val: em.converged ? '✅ Yes' : '❌ No' },
+                    { label: 'Energy Before', val: kJ(em.energy_before_kJ_mol) },
+                    { label: 'Energy After', val: kJ(em.energy_after_kJ_mol) },
+                    { label: 'Max Iterations', val: em.iterations_max },
+                    {
+                        label: 'Converged',
+                        val: em.converged ? '✅ Yes' : '❌ No'
+                            + (em.rms_force_kJ_mol_nm !== null
+                                && em.rms_force_kJ_mol_nm !== undefined
+                                ? ` (RMS force ${em.rms_force_kJ_mol_nm} kJ/mol/nm)` : ''),
+                    },
                 ];
+
+                if (em.excluded_residues && em.excluded_residues.length) {
+                    miniItems.push({
+                        label: 'Held at input coordinates',
+                        val: em.excluded_residues.join(', '),
+                    });
+                }
+                if (em.restrained_atoms) {
+                    miniItems.push({
+                        label: 'Restrained pocket atoms',
+                        val: em.restrained_atoms,
+                    });
+                }
                 miniItems.forEach(({ label, val }) => {
                     const d = document.createElement('div');
                     d.className = 'report-item';
@@ -631,6 +692,24 @@ document.addEventListener('DOMContentLoaded', () => {
                     miniGrid.appendChild(d);
                 });
             }
+        }
+
+        // Warnings. The pipeline records things the user needs to know about
+        // the result - a ligand held at its input coordinates, a repaired
+        // terminus, a suspicious starting energy - and nothing displayed them.
+        const warningsPanel = document.getElementById('warnings-panel');
+        const warningsList = document.getElementById('warnings-list');
+        const warnings = report.warnings || [];
+        warningsList.innerHTML = '';
+        if (warnings.length) {
+            warningsPanel.classList.remove('hidden');
+            warnings.forEach(text => {
+                const li = document.createElement('li');
+                li.textContent = text;
+                warningsList.appendChild(li);
+            });
+        } else {
+            warningsPanel.classList.add('hidden');
         }
 
         // Download PDB/PDBQT button
@@ -1366,9 +1445,13 @@ document.addEventListener('DOMContentLoaded', () => {
             const card = document.createElement('div');
             card.className = 'history-card glass-panel hover-scale';
             
-            const energyDelta = (job.energy_after !== 'N/A' && job.energy_before !== 'N/A') 
+            // Energies are numbers or null. The old check compared against the
+            // string 'N/A', so a null pair passed it and rendered "0.00".
+            const haveEnergies = typeof job.energy_after === 'number'
+                && typeof job.energy_before === 'number';
+            const energyDelta = haveEnergies
                 ? (job.energy_after - job.energy_before).toFixed(2)
-                : 'N/A';
+                : 'not minimized';
             
             card.innerHTML = `
                 <div class="history-card-header">
