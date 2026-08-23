@@ -454,6 +454,66 @@ class TestCleaner(TempDirTest):
         self.assertIn('BTN', text, 'ligand was removed along with the waters')
 
 
+class TestWaterRemoval(TempDirTest):
+    """Feature 5: water removal, whatever the water is called."""
+
+    SPELLINGS = ('HOH', 'WAT', 'H2O', 'TIP', 'SOL', 'DOD')
+
+    def _with_waters(self):
+        def het(serial, name, resn, resseq, x, elem):
+            return (f'HETATM{serial:>5} {name:<4} {resn:>3} A{resseq:>4}    '
+                    f'{x:8.3f}  12.000  12.000  1.00 10.00          {elem:>2}  \n')
+
+        rows = [het(9000 + i, 'O', name, 700 + i, 40.0 + i * 4, 'O')
+                for i, name in enumerate(self.SPELLINGS)]
+        rows.append(het(9100, 'C1', 'LIG', 800, 12.0, 'C'))
+        rows.append(het(9101, 'ZN', ' ZN', 801, 20.0, 'ZN'))
+        return _write(self.path('in.pdb'), _protein_lines() + rows)
+
+    def _heteroatom_names(self, path):
+        return sorted({l[17:20].strip()
+                       for l in pathlib.Path(path).read_text().splitlines()
+                       if l.startswith('HETATM')})
+
+    def test_every_water_spelling_is_removed(self):
+        """Biopython tags only HOH and WAT as 'W'; the rest arrive as H_xxx."""
+        source = self._with_waters()
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure, remove_water=True))
+
+        self.assertEqual(self._heteroatom_names(self.path('out.pdb')),
+                         ['LIG', 'ZN'])
+
+    def test_waters_are_kept_when_not_asked_to_remove(self):
+        source = self._with_waters()
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure, remove_water=False))
+
+        kept = self._heteroatom_names(self.path('out.pdb'))
+        for name in self.SPELLINGS:
+            self.assertIn(name, kept)
+
+    def test_analyzer_counts_every_spelling_as_water(self):
+        metadata = analyzer.analyze_structure(io.load_pdb(self._with_waters()))
+
+        self.assertEqual(metadata['water_count'], len(self.SPELLINGS))
+        self.assertEqual(metadata['heteroatoms'], ['LIG', 'ZN'],
+                         'waters were double-counted as ligands')
+        self.assertEqual(metadata['atom_breakdown']['water'], len(self.SPELLINGS))
+
+    def test_lowercase_water_name_is_recognised(self):
+        row = ('HETATM 9200  O   hoh A 700      40.000  12.000  12.000'
+               '  1.00 10.00           O  \n')
+        source = _write(self.path('lc.pdb'), _protein_lines() + [row])
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure, remove_water=True))
+
+        self.assertEqual(self._heteroatom_names(self.path('out.pdb')), [])
+
+
 class TestProtonator(TempDirTest):
 
     def test_b7_a9_ligand_held_out_and_status_reported(self):
