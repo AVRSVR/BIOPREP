@@ -98,10 +98,85 @@ class TestIO(TempDirTest):
             io.load_pdb(junk)
         self.assertIn('No atoms', str(caught.exception))
 
-    def test_feature1_mmcif_named_pdb_is_rejected(self):
-        cif = _write(self.path('s.pdb'), ['data_1CRN\n', '_entry.id 1CRN\n'])
+    def test_feature1_unparseable_mmcif_is_rejected(self):
+        cif = _write(self.path('s.cif'), ['data_1CRN\n', '_entry.id 1CRN\n'])
         with self.assertRaises(ValueError):
             io.load_pdb(cif)
+
+
+class TestMmcifSupport(TempDirTest):
+    """mmCIF input: RCSB serves it by default, so it must be accepted."""
+
+    def _make_cif(self, name='1crn.cif'):
+        from Bio.PDB import MMCIFIO
+        writer = MMCIFIO()
+        writer.set_structure(io.load_pdb(CRN))
+        path = self.path(name)
+        writer.save(path)
+        return path
+
+    def test_detect_format_by_extension(self):
+        self.assertEqual(io.detect_format(CRN), 'pdb')
+        self.assertEqual(io.detect_format(self._make_cif()), 'mmcif')
+
+    def test_detect_format_prefers_content_over_extension(self):
+        """A .cif downloaded from RCSB and renamed .pdb must still work."""
+        cif = self._make_cif()
+        renamed = self.path('sneaky.pdb')
+        shutil.copy(cif, renamed)
+
+        self.assertEqual(io.detect_format(renamed), 'mmcif')
+        self.assertEqual(sum(1 for _ in io.load_structure(renamed).get_atoms()), 327)
+
+    def test_mmcif_loads_with_same_atom_count_as_pdb(self):
+        cif = io.load_structure(self._make_cif())
+        pdb = io.load_structure(CRN)
+        self.assertEqual(sum(1 for _ in cif.get_atoms()),
+                         sum(1 for _ in pdb.get_atoms()))
+
+    def test_ensure_pdb_passes_pdb_through_untouched(self):
+        path, converted = io.ensure_pdb(CRN, self.tmp)
+        self.assertEqual(path, CRN)
+        self.assertIsNone(converted)
+
+    def test_ensure_pdb_converts_mmcif(self):
+        path, converted = io.ensure_pdb(self._make_cif(), self.tmp)
+        self.assertEqual(converted, 'mmcif')
+        self.assertTrue(path.endswith('.pdb'))
+        self.assertEqual(sum(1 for _ in io.load_pdb(path).get_atoms()), 327)
+
+    def test_structures_too_large_for_pdb_are_refused(self):
+        """
+        PDB has five columns of atom serial and one of chain id. Writing a
+        structure that exceeds either produces a silently corrupt file, so
+        conversion must refuse instead.
+        """
+        class Chain:
+            def __init__(self, identifier):
+                self.id = identifier
+
+        class Model:
+            def __init__(self, chains):
+                self._chains = chains
+
+            def __iter__(self):
+                return iter(self._chains)
+
+        class Structure:
+            def __init__(self, chains):
+                self._models = [Model(chains)]
+
+            def __iter__(self):
+                return iter(self._models)
+
+            def get_atoms(self):
+                return iter([])
+
+        problems = io.check_pdb_representable(Structure([Chain('AAA'), Chain('B')]))
+        self.assertTrue(problems)
+        self.assertIn('AAA', problems[0])
+
+        self.assertEqual(io.check_pdb_representable(io.load_pdb(CRN)), [])
 
 
 class TestCleaner(TempDirTest):

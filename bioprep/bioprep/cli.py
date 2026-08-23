@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 
-from bioprep.core.io import load_pdb, save_pdb
+from bioprep.core.io import load_pdb, save_pdb, ensure_pdb
 from bioprep.core.cleaner import clean_structure
 from bioprep.core.protonator import add_hydrogens
 from bioprep.core.minimizer import minimize_structure, STATUS_FULL
@@ -37,6 +37,9 @@ def main():
 
     print(f"[*] Loading {args.input}...")
     try:
+        args.input, converted_from = ensure_pdb(args.input)
+        if converted_from:
+            print(f"    Converted {converted_from.upper()} input to PDB")
         structure = load_pdb(args.input)
     except Exception as e:
         print(f"[!] Error loading PDB file: {e}")

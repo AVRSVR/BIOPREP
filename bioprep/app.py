@@ -211,14 +211,19 @@ def _server_error(message, exc):
     return jsonify({'error': f'{message}. See server logs for details.'}), 500
 
 
+STRUCTURE_EXTENSIONS = ('.pdb', '.ent', '.cif', '.mmcif')
+
+
 def _require_pdb_upload(field='file'):
     if field not in request.files:
         return None, _fail('No file was uploaded.')
     upload = request.files[field]
     if not upload.filename:
         return None, _fail('No file was selected.')
-    if not upload.filename.lower().endswith('.pdb'):
-        return None, _fail('Only .pdb files are accepted.')
+    if not upload.filename.lower().endswith(STRUCTURE_EXTENSIONS):
+        return None, _fail(
+            'Unsupported file type. Upload a PDB (.pdb, .ent) or '
+            'mmCIF (.cif, .mmcif) structure.')
     return upload, None
 
 

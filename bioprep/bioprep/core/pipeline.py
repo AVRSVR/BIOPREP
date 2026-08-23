@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
-from .io import load_pdb, save_pdb
+from .io import load_pdb, save_pdb, ensure_pdb
 from .cleaner import clean_structure
 from .protonator import add_hydrogens
 from .analyzer import analyze_structure, detect_missing_residues
@@ -135,6 +135,16 @@ def prepare_structure(input_path, workdir, settings, original_filename=None):
     final_path = os.path.join(workdir, f'{base}__prepared.pdb')
 
     # ── Pre-processing analysis ──────────────────────────────────────────────
+    # mmCIF is converted once, here, so every step below sees PDB.
+    # PDBFixer and OpenMM both require it, and detect_missing_residues
+    # reads the path directly rather than the parsed structure.
+    input_path, converted_from = ensure_pdb(input_path, workdir)
+    if converted_from:
+        warnings.append(
+            f"Input was {converted_from.upper()} and was converted to "
+            "PDB for processing; the output is PDB."
+        )
+
     structure = load_pdb(input_path)
     pre = analyze_structure(structure)
     missing_before = detect_missing_residues(input_path)
