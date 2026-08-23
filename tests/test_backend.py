@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
 import unittest
 
@@ -1319,6 +1320,102 @@ class TestExporterFormats(TempDirTest):
 
         self.assertFalse(ok)
         self.assertIn('timed out', message.lower())
+
+
+class TestCli(TempDirTest):
+    """Features 111-112: the command-line interface."""
+
+    def _run(self, *argv):
+        """Call main() in-process with a patched argv; returns (code, stdout)."""
+        import contextlib
+        import io as _stdio
+        from bioprep import cli
+
+        buffer = _stdio.StringIO()
+        original = sys.argv
+        sys.argv = ['bioprep', *argv]
+        try:
+            with contextlib.redirect_stdout(buffer):
+                code = cli.main()
+        finally:
+            sys.argv = original
+        return code, buffer.getvalue()
+
+    def _rich(self):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        # Chain B is offset; superimposed chains give an infinite start energy.
+        chain_b = [l[:21] + 'B' + l[22:30] + f'{float(l[30:38]) + 60.0:8.3f}' + l[38:]
+                   for l in lines]
+        het = (f'HETATM  900  C1  LIG A 900    {x + 6:8.3f}{y:8.3f}{z:8.3f}'
+               '  1.00 10.00           C  \n')
+        water = (f'HETATM  902  O   HOH A 700    {x + 2.8:8.3f}{y:8.3f}{z:8.3f}'
+                 '  1.00 10.00           O  \n')
+        return _write(self.path('rich.pdb'), lines + chain_b + [het, water])
+
+    def _resnames(self, path):
+        return {l[17:20].strip() for l in pathlib.Path(path).read_text().splitlines()
+                if l.startswith('HETATM')}
+
+    def test_feature112_basic_run(self):
+        code, out = self._run('--input', self._rich(), '--output', self.path('o.pdb'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('Cleaning structure', out)
+        self.assertIn('Adding hydrogens', out)
+        self.assertTrue(os.path.isfile(self.path('o.pdb')))
+
+    def test_feature112_water_removed_ligand_kept_by_default(self):
+        self._run('--input', self._rich(), '--output', self.path('o.pdb'))
+        names = self._resnames(self.path('o.pdb'))
+        self.assertNotIn('HOH', names)
+        self.assertIn('LIG', names)
+
+    def test_feature112_chain_flag_is_repeatable(self):
+        source = self._rich()
+        self._run('--input', source, '--output', self.path('a.pdb'), '--chain', 'A')
+        self._run('--input', source, '--output', self.path('ab.pdb'),
+                  '--chain', 'A', '--chain', 'B')
+
+        def chains(path):
+            return {l[21] for l in pathlib.Path(path).read_text().splitlines()
+                    if l[:6] in ('ATOM  ', 'HETATM')}
+
+        self.assertEqual(chains(self.path('a.pdb')), {'A'})
+        self.assertEqual(chains(self.path('ab.pdb')), {'A', 'B'})
+
+    def test_feature112_protect_outranks_remove_all_case_insensitively(self):
+        self._run('--input', self._rich(), '--output', self.path('o.pdb'),
+                  '--remove-het', 'ALL', '--protect', 'lig')
+        self.assertEqual(self._resnames(self.path('o.pdb')), {'LIG'})
+
+    def test_feature112_minimize_reports_energies(self):
+        code, out = self._run('--input', self._rich(), '--output', self.path('o.pdb'),
+                              '--minimize')
+        self.assertEqual(code, 0, out)
+        self.assertIn('kJ/mol', out)
+        self.assertIn('status:', out)
+
+    def test_feature111_unreadable_input_exits_nonzero(self):
+        code, out = self._run('--input', self.path('nope.pdb'),
+                              '--output', self.path('o.pdb'))
+        self.assertEqual(code, 1)
+        self.assertIn('Error loading', out)
+
+    def test_feature112_leaves_no_working_directory_behind(self):
+        import glob as _glob
+
+        def leaked():
+            root = tempfile.gettempdir()
+            return set(_glob.glob(os.path.join(root, 'bioprep_cli_*'))) | \
+                set(_glob.glob(os.path.join(root, 'bioprep_cif_*')))
+
+        before = leaked()
+        self._run('--input', self._rich(), '--output', self.path('o.pdb'))
+        self.assertEqual(leaked(), before)
+
+        # and on the failure path
+        self._run('--input', self.path('nope.pdb'), '--output', self.path('x.pdb'))
+        self.assertEqual(leaked(), before)
 
 
 class TestPipelineSettings(unittest.TestCase):

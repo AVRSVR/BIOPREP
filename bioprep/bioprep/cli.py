@@ -1,5 +1,6 @@
 import argparse
 import os
+import shutil
 import sys
 import tempfile
 
@@ -35,9 +36,21 @@ def main():
 
     args = parser.parse_args()
 
+    # One working directory for every intermediate, removed on the way out.
+    # ensure_pdb would otherwise make its own temporary directory for an mmCIF
+    # conversion that nothing ever cleaned up.
+    workdir = tempfile.mkdtemp(prefix="bioprep_cli_")
+
+    try:
+        return _run(args, workdir)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _run(args, workdir):
     print(f"[*] Loading {args.input}...")
     try:
-        args.input, converted_from = ensure_pdb(args.input)
+        args.input, converted_from = ensure_pdb(args.input, workdir)
         if converted_from:
             print(f"    Converted {converted_from.upper()} input to PDB")
         structure = load_pdb(args.input)
@@ -57,10 +70,8 @@ def main():
         protect_ligands=args.protect,
     )
 
-    fd, cleaned_path = tempfile.mkstemp(suffix=".pdb")
-    os.close(fd)
-    fd, protonated_path = tempfile.mkstemp(suffix=".pdb")
-    os.close(fd)
+    cleaned_path = os.path.join(workdir, "cleaned.pdb")
+    protonated_path = os.path.join(workdir, "protonated.pdb")
 
     try:
         save_pdb(structure, cleaned_path, select=select_obj,
@@ -89,7 +100,6 @@ def main():
                 for warning in stats['warnings']:
                     print(f"[!] {warning}")
         else:
-            import shutil
             shutil.copy2(protonated_path, args.output)
 
         print(f"[*] Structure saved to {args.output}")
@@ -99,10 +109,6 @@ def main():
     except Exception as e:
         print(f"[!] Error during processing: {e}")
         return 1
-    finally:
-        for path in (cleaned_path, protonated_path):
-            if os.path.exists(path):
-                os.remove(path)
 
 
 if __name__ == "__main__":
