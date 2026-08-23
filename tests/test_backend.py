@@ -1077,6 +1077,161 @@ class TestReporter(unittest.TestCase):
         self.assertEqual(report['atom_counts']['delta'], 10)
 
 
+class TestReportContent(unittest.TestCase):
+    """Features 74-80: the report is an audit trail, so it must be accurate."""
+
+    PROTONATION = {
+        'hydrogens_added': True, 'ph': 7.4, 'ligands_preserved': ['BTN'],
+        'ligand_status': [{'residue': 'BTN', 'atoms': 16,
+                           'action': 'preserved', 'reason': 'no template'}],
+        'nonstandard_replaced': ['MSE'], 'loops_reconstructed': 2,
+    }
+    MINIMIZATION = {
+        'status': 'partial', 'force_field': 'amber14',
+        'energy_before_kJ_mol': 900.0, 'energy_after_kJ_mol': -5000.0,
+        'delta_energy_kJ_mol': -5900.0, 'converged': True,
+        'excluded_residues': ['BTN'], 'error': None,
+    }
+
+    def _report(self, **overrides):
+        kwargs = dict(
+            filename='1crn.pdb', chains_detected=['A', 'B'],
+            chains_retained=['A'], waters_removed=12, waters_retained=3,
+            heteroatoms_removed=['SO4'], heteroatoms_retained=['BTN'],
+            ph_used=7.4, missing_residues=[{'chain': 'A', 'residue': 'GLY'}],
+            atoms_before=327, atoms_after=642,
+            protonation=self.PROTONATION, minimization_stats=self.MINIMIZATION,
+            docking_export={'target': 'vina', 'succeeded': True},
+            processing_time_s=3.14159, warnings=['something to note'])
+        kwargs.update(overrides)
+        return reporter.build_report(**kwargs)
+
+    def test_feature74_structure_and_atom_delta(self):
+        report = self._report()
+        self.assertEqual(report['chains'],
+                         {'detected': ['A', 'B'], 'retained': ['A']})
+        self.assertEqual(report['atom_counts']['delta'], 315)
+        self.assertTrue(report['generated_at'].endswith('UTC'))
+
+    def test_feature76_failed_export_does_not_claim_a_target(self):
+        report = self._report(docking_export={'target': 'vina',
+                                              'succeeded': False,
+                                              'error': 'obabel missing'})
+        self.assertNotIn('docking_target', report)
+        self.assertFalse(report['docking_export']['succeeded'])
+
+    def test_feature77_processing_time_rounded(self):
+        self.assertEqual(self._report()['processing_time_seconds'], 3.14)
+
+    def test_feature78_ligand_status_reaches_the_report(self):
+        report = self._report()
+        self.assertEqual(report['protonation']['ligand_status'],
+                         self.PROTONATION['ligand_status'])
+
+    def test_feature79_text_report_sections(self):
+        text = reporter.report_to_text(self._report())
+        for heading in ('PREPARATION REPORT', 'CHAINS', 'WATER MOLECULES',
+                        'HETEROATOMS', 'PROTONATION', 'STRUCTURE',
+                        'ENERGY MINIMIZATION', 'DOCKING EXPORT', 'WARNINGS'):
+            self.assertIn(heading, text)
+        self.assertIn('+315', text)
+        self.assertIn('no template', text)
+        self.assertIn('something to note', text)
+
+    def test_feature79_degenerate_reports_render(self):
+        self.assertIn('BIOPREP', reporter.report_to_text({}))
+        self.assertIn('BIOPREP', reporter.report_to_text(None))
+        self.assertIn('x.pdb', reporter.report_to_text({'input_file': 'x.pdb'}))
+
+    def test_feature80_atom_counter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'm.pdb')
+            with open(path, 'w') as fh:
+                fh.write('REMARK header\n')
+                fh.write('ATOM      1  N   ALA A   1       1.000   2.000'
+                         '   3.000  1.00  0.00           N  \n')
+                fh.write('HETATM    2 ZN    ZN A   2       1.000   2.000'
+                         '   3.000  1.00  0.00          ZN  \n')
+                fh.write('TER\nEND\n')
+            self.assertEqual(reporter.count_atoms_in_pdb(path), 2)
+            self.assertEqual(
+                reporter.count_atoms_in_pdb(os.path.join(tmp, 'nope.pdb')), 0)
+
+
+class TestExporterFormats(TempDirTest):
+    """Features 70-72: the three export targets."""
+
+    def _prepared(self):
+        source = _write(self.path('raw.pdb'), _protein_lines())
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('clean.pdb'),
+                    select=cleaner.clean_structure(structure))
+        protonator.add_hydrogens(self.path('clean.pdb'), self.path('prot.pdb'))
+        return self.path('prot.pdb')
+
+    def test_feature71_gromacs_suffix_and_content(self):
+        source = self._prepared()
+        ok, result = exporter.export_structure(source, self.path('g.pdb'), 'gromacs')
+
+        self.assertTrue(ok)
+        self.assertTrue(str(result).endswith('_gromacs.pdb'))
+        self.assertEqual(reporter.count_atoms_in_pdb(result),
+                         reporter.count_atoms_in_pdb(source))
+
+    def test_feature72_unknown_format_falls_back_to_pdb(self):
+        source = self._prepared()
+        ok, result = exporter.export_structure(source, self.path('u.pdb'), 'nonsense')
+
+        self.assertTrue(ok)
+        self.assertTrue(str(result).endswith('.pdb'))
+        self.assertEqual(reporter.count_atoms_in_pdb(result),
+                         reporter.count_atoms_in_pdb(source))
+
+    def test_feature72_export_onto_own_path_is_a_noop(self):
+        source = self._prepared()
+        before = reporter.count_atoms_in_pdb(source)
+        ok, _ = exporter.export_structure(source, source, 'pdb')
+
+        self.assertTrue(ok)
+        self.assertEqual(reporter.count_atoms_in_pdb(source), before)
+
+    def test_feature73_exit_zero_without_output_is_a_failure(self):
+        """OpenBabel can return 0 having written nothing."""
+        import subprocess as _subprocess
+
+        class Empty:
+            returncode = 0
+            stderr = ''
+
+        original = _subprocess.run
+        exporter.subprocess.run = lambda *a, **k: Empty()
+        try:
+            ok, message = exporter.convert_to_pdbqt(
+                'in.pdb', self.path('never.pdbqt'))
+        finally:
+            exporter.subprocess.run = original
+
+        self.assertFalse(ok)
+        self.assertIn('no output', message.lower())
+
+    def test_feature73_timeout_is_reported(self):
+        import subprocess as _subprocess
+
+        original = _subprocess.run
+
+        def timeout(*args, **kwargs):
+            raise _subprocess.TimeoutExpired('obabel', 120)
+
+        exporter.subprocess.run = timeout
+        try:
+            ok, message = exporter.convert_to_pdbqt('in.pdb', self.path('x.pdbqt'))
+        finally:
+            exporter.subprocess.run = original
+
+        self.assertFalse(ok)
+        self.assertIn('timed out', message.lower())
+
+
 class TestPipelineSettings(unittest.TestCase):
 
     def test_defaults(self):
