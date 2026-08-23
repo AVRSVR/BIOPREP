@@ -1,3 +1,5 @@
+import os
+
 from Bio.PDB import PDBParser, PDBIO
 
 def load_pdb(file_path):
@@ -11,11 +13,13 @@ def load_pdb(file_path):
         Structure: Biopython Structure object.
     """
     parser = PDBParser(QUIET=True)
-    
-    # Generate a dummy structure ID based on the filename
-    filename = file_path.replace("\\", "/").split("/")[-1]
-    structure_id = filename.split(".")[0]
-    
+
+    # Structure ID is the filename without its extension. splitext drops only
+    # the final suffix, so a name like '1abc.v2.pdb' keeps its '1abc.v2' stem
+    # instead of being cut at the first dot.
+    filename = os.path.basename(file_path.replace("\\", os.sep))
+    structure_id = os.path.splitext(filename)[0] or filename
+
     structure = parser.get_structure(structure_id, file_path)
     return structure
 
