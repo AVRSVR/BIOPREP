@@ -165,7 +165,11 @@ def prepare_structure(input_path, workdir, settings, original_filename=None):
         keep_structural_waters=settings.keep_structural_waters,
         protect_ligands=settings.protect_ligands,
     )
-    save_pdb(structure, cleaned_path, select=select_obj)
+    # conect_source carries the input's bond records onto the cleaned
+    # file. Biopython drops CONECT on parse, so without this the
+    # protonator's ligand-bond preservation has nothing left to preserve.
+    save_pdb(structure, cleaned_path, select=select_obj,
+             conect_source=input_path)
 
     if count_atoms_in_pdb(cleaned_path) == 0:
         raise ValueError(

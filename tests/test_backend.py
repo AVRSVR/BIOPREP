@@ -221,6 +221,100 @@ class TestSavePdb(TempDirTest):
                           if l.startswith(('ATOM', 'HETATM'))], [])
 
 
+class TestConectPreservation(TempDirTest):
+    """Bond records must survive a save; Biopython drops them on parse."""
+
+    LIGAND = [
+        'HETATM  900  C1  LIG A 900      12.000  12.000  12.000  1.00 10.00           C  \n',
+        'HETATM  901  C2  LIG A 900      13.500  12.000  12.000  1.00 10.00           C  \n',
+        'HETATM  902  O1  LIG A 900      14.200  13.100  12.000  1.00 10.00           O  \n',
+        'HETATM  903  N1  LIG A 900      14.200  10.900  12.000  1.00 10.00           N  \n',
+    ]
+    CONECT = [
+        'CONECT  900  901\n',
+        'CONECT  901  900  902  903\n',
+        'CONECT  902  901\n',
+        'CONECT  903  901\n',
+    ]
+
+    def _source(self):
+        return _write(self.path('in.pdb'),
+                      _protein_lines() + self.LIGAND + self.CONECT)
+
+    def _bond_names(self, path):
+        """Resolve CONECT records to ligand atom-name pairs."""
+        by_serial, _ = io._serial_index(path)
+        bonds = set()
+        for line in pathlib.Path(path).read_text().splitlines():
+            if not line.startswith('CONECT'):
+                continue
+            serials = list(io.conect_serials(line))
+            for partner in serials[1:]:
+                left, right = by_serial.get(serials[0]), by_serial.get(partner)
+                if left and right and left[3] == 'LIG' and right[3] == 'LIG':
+                    bonds.add(tuple(sorted([left[4], right[4]])))
+        return bonds
+
+    def test_conect_is_carried_across_a_save(self):
+        source = self._source()
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'), conect_source=source)
+
+        self.assertEqual(self._bond_names(self.path('out.pdb')),
+                         {('C1', 'C2'), ('C2', 'O1'), ('C2', 'N1')})
+
+    def test_serials_are_remapped_not_copied(self):
+        """Both files number atoms independently, so serials must be rewritten."""
+        source = self._source()
+        io.save_pdb(io.load_pdb(source), self.path('out.pdb'),
+                    conect_source=source)
+
+        _, out_by_key = io._serial_index(self.path('out.pdb'))
+        new_serial = out_by_key[('A', '900', '', 'LIG', 'C1', '')]
+        self.assertNotEqual(new_serial, 900,
+                            'output still uses the input serial numbering')
+
+        written = [l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                   if l.startswith('CONECT')]
+        self.assertTrue(written)
+        for line in written:
+            for serial in io.conect_serials(line):
+                self.assertIn(serial, out_by_key.values(),
+                              'CONECT references an atom that is not in the file')
+
+    def test_bonds_to_removed_atoms_are_dropped(self):
+        """Filtering a ligand out must not leave dangling bond records."""
+        source = self._source()
+        structure = io.load_pdb(source)
+        select = cleaner.clean_structure(structure, remove_heteroatoms=['ALL'])
+        io.save_pdb(structure, self.path('out.pdb'), select=select,
+                    conect_source=source)
+
+        text = pathlib.Path(self.path('out.pdb')).read_text()
+        self.assertNotIn('LIG', text)
+        self.assertEqual([l for l in text.splitlines() if l.startswith('CONECT')], [])
+
+    def test_without_conect_source_nothing_is_written(self):
+        source = self._source()
+        io.save_pdb(io.load_pdb(source), self.path('out.pdb'))
+        self.assertEqual(self._bond_names(self.path('out.pdb')), set())
+
+    def test_conect_survives_the_full_pipeline(self):
+        from bioprep.core.pipeline import PipelineSettings, prepare_structure
+
+        source = self._source()
+        workdir = self.path('work')
+        os.makedirs(workdir, exist_ok=True)
+
+        outcome = prepare_structure(source, workdir,
+                                    PipelineSettings.from_mapping({}),
+                                    original_filename='in.pdb')
+
+        self.assertEqual(self._bond_names(outcome['viewer_path']),
+                         {('C1', 'C2'), ('C2', 'O1'), ('C2', 'N1')},
+                         'ligand connectivity lost somewhere in the pipeline')
+
+
 class TestMmcifSupport(TempDirTest):
     """mmCIF input: RCSB serves it by default, so it must be accepted."""
 

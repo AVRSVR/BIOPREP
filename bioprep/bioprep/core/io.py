@@ -232,7 +232,125 @@ class SpecCompliantPDBIO(PDBIO):
         )
 
 
-def save_pdb(structure, output_path, select=None):
+def _atom_key_from_line(line):
+    """
+    Identify an atom by its PDB fields rather than its serial number.
+
+    Serials are reassigned on every write, so they cannot be used to match an
+    atom across files. Chain, residue and atom name survive.
+    """
+    return (
+        line[21],              # chain id
+        line[22:26].strip(),   # residue sequence number
+        line[26].strip(),      # insertion code
+        line[17:20].strip(),   # residue name
+        line[12:16].strip(),   # atom name
+        line[16].strip(),      # altloc
+    )
+
+
+def _serial_index(pdb_path):
+    """Return (serial -> key, key -> serial) for one PDB file."""
+    by_serial, by_key = {}, {}
+    try:
+        with open(pdb_path, 'r') as fh:
+            for line in fh:
+                if line[:6] not in ('ATOM  ', 'HETATM'):
+                    continue
+                try:
+                    serial = int(line[6:11])
+                except ValueError:
+                    continue
+                key = _atom_key_from_line(line)
+                by_serial[serial] = key
+                by_key.setdefault(key, serial)
+    except OSError:
+        pass
+    return by_serial, by_key
+
+
+def conect_serials(line):
+    """Yield the atom serials referenced by one CONECT record."""
+    body = line[6:].rstrip('\n')
+    for start in range(0, len(body), 5):
+        chunk = body[start:start + 5].strip()
+        if chunk:
+            try:
+                yield int(chunk)
+            except ValueError:
+                continue
+
+
+def transfer_conect_records(source_path, output_path):
+    """
+    Copy CONECT records from ``source_path`` onto ``output_path``.
+
+    Biopython drops CONECT entirely when parsing, so a saved structure has no
+    bond records at all. Ligand connectivity would otherwise be lost the first
+    time a structure was written, before anything downstream could preserve it.
+
+    Bonds are matched by atom identity, because both files number their atoms
+    independently. A bond is carried over only when both of its atoms survived
+    into the output, so filtering out a ligand also drops its bonds.
+
+    Returns the number of bonds written.
+    """
+    source_by_serial, _ = _serial_index(source_path)
+    _, output_by_key = _serial_index(output_path)
+    if not source_by_serial or not output_by_key:
+        return 0
+
+    bonds = set()
+    try:
+        with open(source_path, 'r') as fh:
+            for line in fh:
+                if not line.startswith('CONECT'):
+                    continue
+                serials = list(conect_serials(line))
+                if len(serials) < 2:
+                    continue
+
+                central = output_by_key.get(source_by_serial.get(serials[0]))
+                if central is None:
+                    continue
+                for partner_serial in serials[1:]:
+                    partner = output_by_key.get(
+                        source_by_serial.get(partner_serial))
+                    if partner is not None and partner != central:
+                        bonds.add((min(central, partner),
+                                   max(central, partner)))
+    except OSError:
+        return 0
+
+    if not bonds:
+        return 0
+
+    partners = {}
+    for first, second in bonds:
+        partners.setdefault(first, set()).add(second)
+        partners.setdefault(second, set()).add(first)
+
+    records = []
+    for central in sorted(partners):
+        listed = sorted(partners[central])
+        # A CONECT record holds at most four partners; spill into extra records.
+        for start in range(0, len(listed), 4):
+            chunk = listed[start:start + 4]
+            records.append('CONECT' + f'{central:>5}'
+                           + ''.join(f'{p:>5}' for p in chunk) + '\n')
+
+    with open(output_path, 'r') as fh:
+        existing = [l for l in fh if not l.startswith(('CONECT', 'END'))]
+
+    with open(output_path, 'w') as fh:
+        fh.writelines(existing)
+        fh.writelines(records)
+        fh.write('END\n')
+
+    return len(bonds)
+
+
+def save_pdb(structure, output_path, select=None, conect_source=None):
     """
     Save a Biopython Structure to a PDB file.
 
@@ -240,6 +358,9 @@ def save_pdb(structure, output_path, select=None):
         structure (Structure): Biopython Structure object.
         output_path (str): Path to write the PDB file.
         select (Select, optional): Biopython Select used to filter atoms.
+        conect_source (str, optional): Path of the file the structure was read
+            from. Its CONECT records are carried onto the output, remapped to
+            the new atom numbering. Without this, bond records are lost.
     """
     parent = os.path.dirname(os.path.abspath(output_path))
     if parent:
@@ -251,3 +372,6 @@ def save_pdb(structure, output_path, select=None):
         io.save(output_path, select)
     else:
         io.save(output_path)
+
+    if conect_source and os.path.exists(conect_source):
+        transfer_conect_records(conect_source, output_path)

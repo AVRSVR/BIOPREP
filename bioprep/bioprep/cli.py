@@ -63,7 +63,8 @@ def main():
     os.close(fd)
 
     try:
-        save_pdb(structure, cleaned_path, select=select_obj)
+        save_pdb(structure, cleaned_path, select=select_obj,
+                 conect_source=args.input)
 
         print(f"[*] Adding hydrogens at pH {args.ph}...")
         prot = add_hydrogens(cleaned_path, protonated_path, ph=args.ph)
