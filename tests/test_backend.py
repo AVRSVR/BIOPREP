@@ -1844,6 +1844,69 @@ class TestScienceCorrectness(TempDirTest):
                         'every hydrogen was typed HD; non-polar ones were kept')
         self.assertNotIn('ROOT', pathlib.Path(result).read_text())
 
+    def test_waters_survive_protonation_and_get_hydrogens(self):
+        """
+        Waters are handed to PDBFixer with the polymer so they are protonated.
+        A stray END record ahead of them once truncated the file and every
+        water was silently dropped.
+        """
+        lines = _protein_lines()
+        anchor = next(l for l in lines if l[12:16].strip() == 'O')
+        x, y, z = (float(anchor[30:38]), float(anchor[38:46]), float(anchor[46:54]))
+
+        waters = [
+            f'HETATM  9{i:02d}  O   HOH A {700 + i:3d}    '
+            f'{x + 2.8 + i * 0.2:8.3f}{y:8.3f}{z:8.3f}  1.00 10.00           O  \n'
+            for i in range(3)
+        ]
+        source = _write(self.path('w.pdb'), lines + waters)
+
+        protonator.add_hydrogens(source, self.path('out.pdb'))
+        written = [l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                   if l[:6] in ('ATOM  ', 'HETATM')]
+
+        residues = {(l[21], l[22:26]) for l in written
+                    if l[17:20].strip() == 'HOH'}
+        self.assertEqual(len(residues), 3, 'waters were lost during protonation')
+
+        hydrogens = sum(1 for l in written
+                        if l[17:20].strip() == 'HOH' and l[76:78].strip() == 'H')
+        self.assertEqual(hydrogens, 6, 'expected two hydrogens per water')
+
+    def test_end_record_does_not_truncate_the_input(self):
+        """`_write` appends END; it must not cut the file short."""
+        from bioprep.core.protonator import _split_records
+
+        lines = _protein_lines()
+        water = ('HETATM  900  O   HOH A 700      10.000  10.000  10.000'
+                 '  1.00 10.00           O  \n')
+        source = _write(self.path('e.pdb'), lines + [water])
+
+        polymer, waters, ligands, _ = _split_records(source)
+        self.assertTrue(waters, 'water was not separated out')
+        for line in polymer:
+            self.assertNotEqual(line[:6].strip(), 'END',
+                                'an END record survived into the polymer')
+
+    def test_terminal_is_repaired_even_with_waters_present(self):
+        """
+        Waters carry the protein's chain id. Without a TER between them,
+        PDBFixer stops seeing the last amino acid as the chain's end and never
+        adds the terminal OXT, leaving a structure that will not parameterise.
+        """
+        lines = [l for l in _protein_lines() if l[12:16].strip() != 'OXT']
+        water = ('HETATM  900  O   HOH A 700      10.000  10.000  10.000'
+                 '  1.00 10.00           O  \n')
+        source = _write(self.path('t.pdb'), lines + [water])
+
+        result = protonator.add_hydrogens(source, self.path('out.pdb'))
+        text = pathlib.Path(self.path('out.pdb')).read_text()
+
+        self.assertGreater(result['terminals_repaired'], 0,
+                           'no terminal added while waters were present')
+        self.assertIn('OXT', text)
+        self.assertIn('HOH', text)
+
     def _protonated_crn(self):
         structure = io.load_pdb(CRN)
         io.save_pdb(structure, self.path('c.pdb'),
