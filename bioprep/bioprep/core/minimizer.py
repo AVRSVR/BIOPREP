@@ -29,6 +29,19 @@ logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 1000
 ENERGY_TOLERANCE = 10.0          # kJ/mol/nm
+
+# No bond constraints. Constraining X-H bonds exists to permit a longer MD
+# timestep; nothing here integrates dynamics - the Langevin integrator is
+# present only because Simulation requires one. During a pure minimisation
+# constraints do two unhelpful things: they stop hydrogens relaxing, and the
+# forces reported by getForces() then carry constraint contributions, so the
+# residual force cannot be compared against the tolerance at all. Measured on
+# 1CRN after 1000 iterations:
+#
+#                   final energy       RMS force
+#   HBonds          -5162.7 kJ/mol     71.16 kJ/mol/nm   (never reaches 10)
+#   unconstrained   -5166.9 kJ/mol      5.76 kJ/mol/nm   (converged)
+MINIMISATION_CONSTRAINTS = None
 SUSPECT_ENERGY = 1.0e12          # kJ/mol — beyond this, geometry is suspect
 
 # Tier 2 deletes the residues no force field can parameterise, which leaves the
@@ -106,7 +119,7 @@ def _create_system(topology, positions, forcefield, allow_terminal_fix=True):
     """
     try:
         system = forcefield.createSystem(
-            topology, nonbondedMethod=app.NoCutoff, constraints=app.HBonds)
+            topology, nonbondedMethod=app.NoCutoff, constraints=MINIMISATION_CONSTRAINTS)
         return system, topology, positions, False
     except Exception as exc:
         if not allow_terminal_fix:
@@ -117,7 +130,7 @@ def _create_system(topology, positions, forcefield, allow_terminal_fix=True):
         modeller.addHydrogens(forcefield=forcefield)
         system = forcefield.createSystem(
             modeller.topology, nonbondedMethod=app.NoCutoff,
-            constraints=app.HBonds)
+            constraints=MINIMISATION_CONSTRAINTS)
         return system, modeller.topology, modeller.positions, True
 
 
@@ -176,14 +189,28 @@ def _run(topology, positions, forcefield, restrain_indices=()):
         maxIterations=MAX_ITERATIONS, tolerance=ENERGY_TOLERANCE
     )
 
-    state = simulation.context.getState(getEnergy=True, getPositions=True)
+    state = simulation.context.getState(getEnergy=True, getPositions=True,
+                                        getForces=True)
     after = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
     if math.isnan(after) or math.isinf(after):
         raise ValueError(
             f"Minimisation produced a non-finite energy ({after}); the result "
             "is unusable."
         )
-    return state.getPositions(), before, after, topology, repaired
+
+    # Whether the minimiser actually finished is a question about the residual
+    # force, not about the energy having gone down. A run stopped early by the
+    # iteration cap still lowers the energy, so an energy-based flag reports
+    # success for a structure that is nowhere near a minimum.
+    # OpenMM halts when the root-mean-square of all force components reaches
+    # the tolerance, so that is the quantity to compare against - not the
+    # largest per-atom force, which the HBonds constraints keep high on
+    # hydrogens regardless of how well converged the structure is.
+    forces = np.asarray(state.getForces(asNumpy=True).value_in_unit(
+        unit.kilojoule_per_mole / unit.nanometer))
+    rms_force = float(np.sqrt(np.mean(forces ** 2)))
+
+    return state.getPositions(), before, after, topology, repaired, rms_force
 
 
 def _safe_subset(pdb):
@@ -292,6 +319,7 @@ def minimize_structure(input_pdb_path, output_pdb_path,
         'energy_tolerance_kJ_mol_nm': ENERGY_TOLERANCE,
         'energy_decreased': False,
         'converged': False,
+        'rms_force_kJ_mol_nm': None,
         'terminals_repaired': False,
         'restrained_atoms': 0,
         'excluded_residues': [],
@@ -332,7 +360,7 @@ def minimize_structure(input_pdb_path, output_pdb_path,
                 if modeller is None:
                     # Nothing to strip, so this tier cannot differ from Tier 1.
                     continue
-                positions, before, after, sub_topology, repaired = _run(
+                positions, before, after, sub_topology, repaired, rms_force = _run(
                     modeller.topology, modeller.positions, forcefield,
                     restrain_indices=lining
                 )
@@ -349,7 +377,7 @@ def minimize_structure(input_pdb_path, output_pdb_path,
                       "they were absent."
                 )
             else:
-                positions, before, after, topology, repaired = _run(
+                positions, before, after, topology, repaired, rms_force = _run(
                     pdb.topology, pdb.positions, forcefield
                 )
                 _write(output_pdb_path, topology, positions)
@@ -377,9 +405,11 @@ def minimize_structure(input_pdb_path, output_pdb_path,
                 'energy_after_kJ_mol': round(after, 1),
                 'delta_energy_kJ_mol': round(delta, 1),
                 'energy_decreased': delta < -0.1,
-                # Converged means the minimiser found a real improvement, or it
-                # started at a sensible energy and had nothing left to gain.
-                'converged': (delta < -1.0) or (abs(delta) < 1.0 and after < 0),
+                'rms_force_kJ_mol_nm': round(rms_force, 3),
+                # Converged means the minimiser reached the force tolerance it
+                # was given, not merely that the energy fell. Capping the
+                # iterations stops it early; that is reported as not converged.
+                'converged': rms_force <= ENERGY_TOLERANCE,
             })
             return result
 

@@ -49,11 +49,18 @@ def convert_to_pdbqt(pdb_path, pdbqt_path):
     ligand-style torsion tree (ROOT/BRANCH records), which AutoDock and Vina
     will not accept as a receptor.
     """
+    # No -xh. In OpenBabel that option means "preserve hydrogens", not "merge
+    # non-polar hydrogens" as it is often assumed to. With it, every hydrogen
+    # survives and OpenBabel types all of them HD - the AutoDock type for a
+    # hydrogen bonded to N or O - so carbon-bound hydrogens are presented to
+    # the scoring function as hydrogen-bond donors. On streptavidin that was
+    # 842 hydrogens all typed HD, against 213 genuinely polar ones. The default
+    # behaviour merges the non-polar hydrogens, which is the conventional
+    # AutoDock and Vina receptor.
     command = [
         'obabel', pdb_path,
         '-O', pdbqt_path,
         '-xr',                            # rigid receptor, no torsion tree
-        '-xh',                            # merge non-polar hydrogens
         '--partialcharge', 'gasteiger',
     ]
 

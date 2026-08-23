@@ -1780,6 +1780,70 @@ class TestScienceCorrectness(TempDirTest):
         self.assertAlmostEqual(recomputed, sites[0]['drugability_score'],
                                delta=0.02)
 
+    def test_convergence_is_a_force_test_not_an_energy_test(self):
+        """
+        A run stopped by the iteration cap still lowers the energy, so an
+        energy-based flag calls it converged when it is nowhere near a minimum.
+        """
+        source = self._protonated_crn()
+        original = minimizer.MAX_ITERATIONS
+        try:
+            minimizer.MAX_ITERATIONS = 5
+            short = minimizer.minimize_structure(source, self.path('short.pdb'))
+            minimizer.MAX_ITERATIONS = 1000
+            full = minimizer.minimize_structure(source, self.path('full.pdb'))
+        finally:
+            minimizer.MAX_ITERATIONS = original
+
+        # both lower the energy
+        self.assertTrue(short['energy_decreased'])
+        self.assertTrue(full['energy_decreased'])
+
+        # but only the complete run is converged
+        self.assertFalse(short['converged'],
+                         'a 5-iteration run must not report convergence')
+        self.assertTrue(full['converged'])
+
+        self.assertGreater(short['rms_force_kJ_mol_nm'],
+                           full['rms_force_kJ_mol_nm'])
+        self.assertLessEqual(full['rms_force_kJ_mol_nm'],
+                             minimizer.ENERGY_TOLERANCE)
+
+    def test_minimisation_is_unconstrained(self):
+        """
+        Constraints exist for an MD timestep; nothing here runs dynamics, and
+        they make the residual force incomparable to the tolerance.
+        """
+        self.assertIsNone(minimizer.MINIMISATION_CONSTRAINTS)
+
+    def test_pdbqt_receptor_has_only_polar_hydrogens(self):
+        """
+        OpenBabel's -xh means 'preserve hydrogens', not 'merge non-polar
+        hydrogens'. With it every hydrogen survived and was typed HD, the
+        AutoDock type for a hydrogen on N or O, so carbon-bound hydrogens were
+        presented to the scoring function as hydrogen-bond donors.
+        """
+        if not shutil.which('obabel'):
+            self.skipTest('OpenBabel not on PATH')
+
+        source = self._protonated_crn()
+        total_h = sum(1 for l in pathlib.Path(source).read_text().splitlines()
+                      if l[:6] in ('ATOM  ', 'HETATM') and l[76:78].strip() == 'H')
+
+        ok, result = exporter.export_structure(source, self.path('r.pdb'), 'vina')
+        self.assertTrue(ok, result)
+
+        types = {}
+        for line in pathlib.Path(result).read_text().splitlines():
+            if line[:6] in ('ATOM  ', 'HETATM') and len(line) > 77:
+                key = line[77:79].strip()
+                types[key] = types.get(key, 0) + 1
+
+        self.assertIn('HD', types)
+        self.assertLess(types['HD'], total_h,
+                        'every hydrogen was typed HD; non-polar ones were kept')
+        self.assertNotIn('ROOT', pathlib.Path(result).read_text())
+
     def _protonated_crn(self):
         structure = io.load_pdb(CRN)
         io.save_pdb(structure, self.path('c.pdb'),
