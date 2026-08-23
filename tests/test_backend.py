@@ -144,6 +144,31 @@ class TestProtonator(TempDirTest):
         with self.assertRaises(ValueError):
             protonator.add_hydrogens(source, self.path('out.pdb'))
 
+    def test_failed_parse_reports_the_real_error_and_leaks_nothing(self):
+        """PDBFixer leaves its handle open on a parse failure.
+
+        On Windows the open handle made the temp-file cleanup raise WinError 32
+        from inside the finally block, replacing the real diagnostic with a
+        message naming an internal temp path.
+        """
+        import glob as _glob
+
+        source = _write(self.path('bad.pdb'), [
+            'ATOM      1  N   ALA A   1      NOTNUMERIC\n'])
+
+        pattern = os.path.join(tempfile.gettempdir(), '*_prot*.pdb')
+        before = set(_glob.glob(pattern))
+
+        with self.assertRaises(Exception) as caught:
+            protonator.add_hydrogens(source, self.path('out.pdb'))
+
+        message = str(caught.exception)
+        self.assertNotIn('WinError', message, 'cleanup masked the real error')
+        self.assertNotIn(tempfile.gettempdir(), message,
+                         'an internal temp path leaked into the error')
+        self.assertEqual(set(_glob.glob(pattern)), before,
+                         'temp files leaked on the failure path')
+
     def test_multi_model_input_is_not_concatenated(self):
         """MODEL/ENDMDL are dropped on write, so later models must not be read."""
         lines = _protein_lines()

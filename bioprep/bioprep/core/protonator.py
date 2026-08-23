@@ -196,7 +196,12 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
             fh.writelines(biopolymer)
             fh.write('END\n')
 
-        fixer = PDBFixer(filename=protein_only)
+        # PDBFixer(filename=...) closes its handle only on the success path —
+        # a parse failure leaves the file open, and on Windows the open handle
+        # makes the cleanup below fail with WinError 32, masking the real
+        # error. Owning the handle here guarantees it is released either way.
+        with open(protein_only, 'r') as fh:
+            fixer = PDBFixer(pdbfile=fh)
 
         fixer.findMissingResidues()
         if reconstruct_loops:
@@ -229,8 +234,13 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
         _merge(protonated, ligand_lines, ligand_conect, output_pdb_path)
 
     finally:
+        # Never let cleanup raise: an error here would replace whatever went
+        # wrong above, and the caller would see a temp-file path instead of
+        # the real diagnostic.
         for path in (protein_only, protonated):
-            if os.path.exists(path):
+            try:
                 os.remove(path)
+            except OSError:
+                pass
 
     return result
