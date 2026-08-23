@@ -1,5 +1,18 @@
 from Bio.PDB import Select, NeighborSearch
 
+from .residues import is_water
+
+
+def _is_water_residue(residue):
+    """
+    True for any water, however it is named.
+
+    Biopython only tags HOH and WAT with hetfield 'W'. SOL, TIP3, TIP4, DOD and
+    friends arrive as ordinary heteroatoms, so a bare ``hetfield == 'W'`` test
+    lets them slip past water removal and into the ligand branch.
+    """
+    return residue.id[0] == 'W' or is_water(residue.resname)
+
 
 class BioPrepSelect(Select):
     """
@@ -34,7 +47,7 @@ class BioPrepSelect(Select):
         chain_id = residue.get_parent().id
 
         # 1. Handle Water
-        if hetfield == 'W':
+        if _is_water_residue(residue):
             if self.keep_structural_waters and (chain_id, residue.id) in self.structural_waters:
                 return 1
             return 0 if self.remove_water else 1
@@ -91,11 +104,10 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
                 if target_chains and chain.id not in target_chains:
                     continue
                 for residue in chain:
-                    hetfield = residue.id[0]
-                    if hetfield == ' ':
+                    if residue.id[0] == ' ':
                         # Standard amino acid — add all atoms to reference
                         protein_atoms.extend(residue.get_atoms())
-                    elif hetfield == 'W':
+                    elif _is_water_residue(residue):
                         water_residues.append((chain.id, residue))
 
         # Build NeighborSearch from protein atoms (the reference), then query

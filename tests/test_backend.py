@@ -95,6 +95,27 @@ class TestCleaner(TempDirTest):
         self.assertEqual(chains, ['A'],
                          'a distant water in another chain was preserved')
 
+    def test_water_removal_covers_non_hoh_names(self):
+        """Biopython tags only HOH/WAT as 'W'; SOL and TIP3 arrive as heteroatoms."""
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        lines += [
+            'HETATM 9100  O   HOH A 700    %8.3f%8.3f%8.3f  1.00  0.00           O  \n' % (x + 40, y, z),
+            'HETATM 9101  O   SOL A 701    %8.3f%8.3f%8.3f  1.00  0.00           O  \n' % (x + 44, y, z),
+            'HETATM 9102  O   TIP3A 702    %8.3f%8.3f%8.3f  1.00  0.00           O  \n' % (x + 48, y, z),
+            'HETATM 9103  C1  BTN A 900    %8.3f%8.3f%8.3f  1.00  0.00           C  \n' % (x + 5, y, z),
+        ]
+        source = _write(self.path('in.pdb'), lines)
+
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure, remove_water=True))
+
+        text = pathlib.Path(self.path('out.pdb')).read_text()
+        for name in ('HOH', 'SOL', 'TIP'):
+            self.assertNotIn(name, text, '%s water survived remove_water' % name)
+        self.assertIn('BTN', text, 'ligand was removed along with the waters')
+
 
 class TestProtonator(TempDirTest):
 
