@@ -53,6 +53,57 @@ class TempDirTest(unittest.TestCase):
         return os.path.join(self.tmp, name)
 
 
+class TestIO(TempDirTest):
+    """Feature 1: PDB loading via PDBParser(QUIET=True)."""
+
+    ATOM_LINE = ('ATOM      1  N   ALA A   1      11.104   6.134  -6.504'
+                 '  1.00  0.00           N\n')
+
+    def test_feature1_loads_pdb_and_returns_structure(self):
+        structure = io.load_pdb(CRN)
+        self.assertEqual(sum(1 for _ in structure.get_atoms()), 327)
+        self.assertEqual(structure.id, '1crn')
+
+    def test_feature1_quiet_suppresses_construction_warnings(self):
+        """QUIET=True is the feature; a messy file must not emit warnings."""
+        import warnings as _warnings
+
+        messy = _write(self.path('messy.pdb'), [
+            self.ATOM_LINE,
+            self.ATOM_LINE.replace('  N   ALA', '  CA  ALA'),
+            self.ATOM_LINE.replace('  N   ALA', '  CA  ALA'),   # duplicate atom
+            self.ATOM_LINE.replace('ALA A   1', 'GLY B   1'),   # chain break
+            self.ATOM_LINE.replace('ALA A   1', 'ALA A   2'),
+        ])
+
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter('always')
+            io.load_pdb(messy)
+
+        self.assertEqual(len(caught), 0,
+                         'QUIET=True did not suppress parser warnings')
+
+    def test_feature2_structure_id_keeps_the_whole_stem(self):
+        for name, expected in (('1abc.pdb', '1abc'), ('1abc.v2.pdb', '1abc.v2')):
+            path = _write(self.path(name), [self.ATOM_LINE])
+            self.assertEqual(io.load_pdb(path).id, expected)
+
+    def test_feature1_non_pdb_file_is_rejected_at_load(self):
+        """
+        PDBParser returns an empty Structure for any text file. Without a guard
+        the failure surfaced later as a misleading 'cleaning removed every atom'.
+        """
+        junk = _write(self.path('junk.pdb'), ['this is not a pdb file\n'])
+        with self.assertRaises(ValueError) as caught:
+            io.load_pdb(junk)
+        self.assertIn('No atoms', str(caught.exception))
+
+    def test_feature1_mmcif_named_pdb_is_rejected(self):
+        cif = _write(self.path('s.pdb'), ['data_1CRN\n', '_entry.id 1CRN\n'])
+        with self.assertRaises(ValueError):
+            io.load_pdb(cif)
+
+
 class TestCleaner(TempDirTest):
 
     def test_b5_protected_ligand_survives_remove_all(self):

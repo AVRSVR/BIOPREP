@@ -288,6 +288,10 @@ def analyze():
             'metadata': metadata,
             'session_id': session_id,
         })
+    except ValueError as exc:
+        # Unreadable or non-PDB upload: the user can fix this, so say what is
+        # wrong rather than returning a generic 500.
+        return _fail(str(exc))
     except Exception as exc:
         return _server_error('Analysis failed', exc)
     finally:
