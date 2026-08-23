@@ -735,6 +735,186 @@ class TestProtonator(TempDirTest):
         self.assertEqual(bonded, serials, 'ligand CONECT serials were not remapped')
 
 
+class TestProtonationFeatures(TempDirTest):
+    """Features 12-22: pH, ligand separation, repairs, status report."""
+
+    @staticmethod
+    def _het(serial, name, resn, chain, resseq, x, y, z, elem):
+        return (f'HETATM{serial:>5} {name:<4} {resn:>3} {chain:1}{resseq:>4}    '
+                f'{x:8.3f}{y:8.3f}{z:8.3f}  1.00 10.00          {elem:>2}  \n')
+
+    @staticmethod
+    def _hydrogens(path):
+        return sum(1 for l in pathlib.Path(path).read_text().splitlines()
+                   if l.startswith(('ATOM', 'HETATM')) and l[76:78].strip() == 'H')
+
+    def _with_ligand(self):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        return _write(self.path('in.pdb'), lines + [
+            self._het(900, 'C1', 'LIG', 'A', 900, x + 6, y, z, 'C'),
+            self._het(901, 'C2', 'LIG', 'A', 900, x + 7.5, y, z, 'C'),
+            self._het(902, 'O1', 'LIG', 'A', 900, x + 8.2, y + 1.1, z, 'O'),
+        ])
+
+    def test_feature12_hydrogen_count_depends_on_ph(self):
+        source = _write(self.path('p.pdb'), _protein_lines())
+        counts = {}
+        for ph in (1.0, 13.0):
+            out = self.path(f'ph{ph}.pdb')
+            protonator.add_hydrogens(source, out, ph=ph)
+            counts[ph] = self._hydrogens(out)
+
+        self.assertGreater(counts[1.0], 0)
+        self.assertGreater(counts[1.0], counts[13.0],
+                           'acidic pH should protonate more than basic')
+
+    def test_feature12_default_ph_is_7_4(self):
+        source = _write(self.path('p.pdb'), _protein_lines())
+        result = protonator.add_hydrogens(source, self.path('o.pdb'))
+        self.assertEqual(result['ph'], 7.4)
+
+    def test_feature13_14_ligand_is_untouched(self):
+        source = self._with_ligand()
+        result = protonator.add_hydrogens(source, self.path('out.pdb'))
+
+        original = [l for l in pathlib.Path(source).read_text().splitlines()
+                    if l[17:20].strip() == 'LIG']
+        written = [l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                   if l[17:20].strip() == 'LIG']
+
+        self.assertEqual(result['ligands_preserved'], ['LIG'])
+        self.assertEqual(len(written), len(original))
+        for before, after in zip(original, written):
+            self.assertEqual(before[30:54], after[30:54], 'ligand coordinates moved')
+        self.assertTrue(all(l[76:78].strip() != 'H' for l in written),
+                        'hydrogens were added to the ligand')
+
+    def test_feature13_waters_are_not_held_out_as_ligands(self):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        source = _write(self.path('w.pdb'), lines + [
+            self._het(950, 'O', 'HOH', 'A', 700, x + 2.8, y, z, 'O')])
+
+        result = protonator.add_hydrogens(source, self.path('out.pdb'))
+        self.assertEqual(result['ligands_preserved'], [])
+
+    def test_feature19_merge_produces_unique_ascending_serials(self):
+        source = self._with_ligand()
+        protonator.add_hydrogens(source, self.path('out.pdb'))
+
+        serials = [int(l[6:11]) for l in
+                   pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                   if l[:6] in ('ATOM  ', 'HETATM')]
+        self.assertEqual(serials, sorted(serials))
+        self.assertEqual(len(serials), len(set(serials)))
+
+    def test_feature16_loops_only_rebuilt_when_asked(self):
+        with open(CRN) as fh:
+            seqres = [l for l in fh if l.startswith('SEQRES')]
+        gapped = [l for l in _protein_lines() if not (20 <= int(l[22:26]) <= 24)]
+        source = _write(self.path('gap.pdb'), seqres + gapped)
+
+        off = protonator.add_hydrogens(source, self.path('off.pdb'),
+                                       reconstruct_loops=False)
+        on = protonator.add_hydrogens(source, self.path('on.pdb'),
+                                      reconstruct_loops=True)
+
+        self.assertEqual(off['loops_reconstructed'], 0)
+        self.assertEqual(on['loops_reconstructed'], 5)
+
+        def resseqs(path):
+            return {int(l[22:26]) for l in
+                    pathlib.Path(path).read_text().splitlines()
+                    if l.startswith('ATOM')}
+
+        self.assertFalse(resseqs(self.path('off.pdb')) & {20, 21, 22, 23, 24})
+        self.assertLessEqual({20, 21, 22, 23, 24}, resseqs(self.path('on.pdb')))
+
+    def test_feature18_hydrogen_failure_is_caught_not_raised(self):
+        """The documented try/except: warn, keep the structure, do not crash."""
+        import pdbfixer
+
+        source = _write(self.path('p.pdb'), _protein_lines())
+        original = pdbfixer.PDBFixer.addMissingHydrogens
+
+        def explode(self, ph=7.0, *args, **kwargs):
+            raise RuntimeError('simulated template failure')
+
+        pdbfixer.PDBFixer.addMissingHydrogens = explode
+        try:
+            result = protonator.add_hydrogens(source, self.path('out.pdb'))
+        finally:
+            pdbfixer.PDBFixer.addMissingHydrogens = original
+
+        self.assertFalse(result['hydrogens_added'])
+        self.assertTrue(any('simulated' in w for w in result['warnings']))
+        self.assertTrue(os.path.isfile(self.path('out.pdb')),
+                        'structure was lost when protonation failed')
+
+    def test_feature20_status_report_explains_why(self):
+        source = self._with_ligand()
+        result = protonator.add_hydrogens(source, self.path('out.pdb'))
+
+        self.assertTrue(result['ligand_status'])
+        entry = result['ligand_status'][0]
+        self.assertEqual(entry['residue'], 'LIG')
+        self.assertEqual(entry['atoms'], 3)
+        self.assertEqual(entry['action'], 'preserved')
+        self.assertIn('protonation', entry['reason'].lower())
+
+    def test_feature20_reason_reaches_the_text_report(self):
+        from bioprep.core.pipeline import PipelineSettings, prepare_structure
+
+        source = self._with_ligand()
+        workdir = self.path('work')
+        os.makedirs(workdir, exist_ok=True)
+        outcome = prepare_structure(source, workdir,
+                                    PipelineSettings.from_mapping({}),
+                                    original_filename='in.pdb')
+
+        text = reporter.report_to_text(outcome['report'])
+        self.assertIn('LIG', text)
+        self.assertIn('Blind protonation', text)
+
+    def test_feature21_no_temp_files_left_behind(self):
+        import glob as _glob
+
+        def leaked():
+            root = tempfile.gettempdir()
+            return set(_glob.glob(os.path.join(root, '*_protein.pdb'))) | \
+                set(_glob.glob(os.path.join(root, '*_protonated.pdb')))
+
+        source = self._with_ligand()
+        before = leaked()
+        protonator.add_hydrogens(source, self.path('out.pdb'))
+        self.assertEqual(leaked(), before)
+
+        # and on the error path
+        ligand_only = _write(self.path('lig.pdb'), [
+            self._het(900, 'C1', 'LIG', 'A', 900, 1, 1, 1, 'C')])
+        with self.assertRaises(ValueError):
+            protonator.add_hydrogens(ligand_only, self.path('x.pdb'))
+        self.assertEqual(leaked(), before)
+
+    def test_feature22_chain_ids_and_numbering_preserved(self):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        source = _write(self.path('multi.pdb'),
+                        lines + [l[:21] + 'B' + l[22:] for l in lines] +
+                        [self._het(960, 'C1', 'LIG', 'C', 900, x + 6, y, z, 'C')])
+
+        protonator.add_hydrogens(source, self.path('out.pdb'))
+        written = pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+
+        chains = sorted({l[21] for l in written if l[:6] in ('ATOM  ', 'HETATM')})
+        self.assertEqual(chains, ['A', 'B', 'C'])
+
+        numbers = [int(l[22:26]) for l in written
+                   if l.startswith('ATOM') and l[21] == 'A']
+        self.assertEqual((min(numbers), max(numbers)), (1, 46))
+
+
 class TestMinimizer(TempDirTest):
 
     def _prepared(self, extra_lines=()):

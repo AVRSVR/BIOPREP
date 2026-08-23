@@ -49,6 +49,7 @@ def build_report(
             "hydrogens_added": protonation.get("hydrogens_added", False),
             "ph": protonation.get("ph", ph_used),
             "ligands_preserved": protonation.get("ligands_preserved", []),
+            "ligand_status": protonation.get("ligand_status", []),
             "nonstandard_replaced": protonation.get("nonstandard_replaced", []),
             "loops_reconstructed": protonation.get("loops_reconstructed", 0),
         },
@@ -129,6 +130,19 @@ def report_to_text(report):
         f"  Ligands Protected : {_join(protonation.get('ligands_preserved'))}",
         f"  Nonstandard Fixed : {_join(protonation.get('nonstandard_replaced'))}",
         f"  Loops Rebuilt     : {protonation.get('loops_reconstructed', 0)}",
+    ]
+
+    # Explain the protected ligands rather than just naming them: coming out
+    # with no hydrogens looks like a failure unless the reason is stated.
+    for entry in protonation.get("ligand_status") or []:
+        lines += [
+            "",
+            f"  {entry.get('residue', '?')} "
+            f"({entry.get('atoms', '?')} atoms): {entry.get('action', 'preserved')}",
+            f"    {entry.get('reason', '')}",
+        ]
+
+    lines += [
         "",
         "-- STRUCTURE ------------------------------------------------",
         f"  Missing Residues: {len(report.get('missing_residues_detected') or [])}",

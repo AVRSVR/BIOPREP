@@ -170,15 +170,35 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
         'hydrogens_added': False,
         'ph': ph,
         'ligands_preserved': [],
+        'ligand_status': [],
         'nonstandard_replaced': [],
         'loops_reconstructed': 0,
         'warnings': [],
     }
 
     biopolymer, ligand_lines, ligand_conect = _split_records(input_pdb_path)
-    result['ligands_preserved'] = sorted(
-        {line[17:20].strip() for line in ligand_lines}
-    )
+
+    # Record not just which ligands were held back but why, so the preparation
+    # report can explain an otherwise surprising result: the ligand comes out
+    # with no hydrogens on it, and that is deliberate.
+    atoms_per_ligand = {}
+    for line in ligand_lines:
+        atoms_per_ligand[line[17:20].strip()] = \
+            atoms_per_ligand.get(line[17:20].strip(), 0) + 1
+
+    result['ligands_preserved'] = sorted(atoms_per_ligand)
+    result['ligand_status'] = [
+        {
+            'residue': name,
+            'atoms': atoms_per_ligand[name],
+            'action': 'preserved',
+            'reason': ('Held out of PDBFixer, which has no template for it. '
+                       'Blind protonation would alter the ligand geometry, so '
+                       'its coordinates are carried through unchanged and no '
+                       'hydrogens are added to it.'),
+        }
+        for name in sorted(atoms_per_ligand)
+    ]
 
     if not any(l[:6] in ('ATOM  ', 'HETATM') for l in biopolymer):
         raise ValueError(
