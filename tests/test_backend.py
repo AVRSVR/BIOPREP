@@ -1090,6 +1090,144 @@ class TestAnalyzer(TempDirTest):
         self.assertEqual(gaps[0]['chain'], 'A')
 
 
+class TestAnalyzerFeatures(TempDirTest):
+    """Features 23-28: chains, waters, ligands, atom counts, gaps."""
+
+    @staticmethod
+    def _het(serial, name, resn, chain, resseq, x, elem):
+        return (f'HETATM{serial:>5} {name:<4} {resn:>3} {chain:1}{resseq:>4}    '
+                f'{x:8.3f}  12.000  12.000  1.00 10.00          {elem:>2}  \n')
+
+    def _seqres(self):
+        with open(CRN) as fh:
+            return [l for l in fh if l.startswith('SEQRES')]
+
+    def test_feature23_lists_every_chain_once(self):
+        lines = _protein_lines()
+        source = _write(self.path('c.pdb'),
+                        lines + [l[:21] + 'B' + l[22:] for l in lines]
+                        + [l[:21] + 'C' + l[22:] for l in lines])
+        self.assertEqual(analyzer.analyze_structure(io.load_pdb(source))['chains'],
+                         ['A', 'B', 'C'])
+
+    def test_feature25_heteroatom_names_are_unique_and_exclude_water(self):
+        rows = [self._het(9100, 'C1', 'LIG', 'A', 800, 12.0, 'C'),
+                self._het(9101, 'C2', 'LIG', 'A', 800, 13.0, 'C'),
+                self._het(9102, 'S', 'SO4', 'A', 801, 16.0, 'S'),
+                self._het(9103, 'O', 'HOH', 'A', 700, 40.0, 'O')]
+        source = _write(self.path('h.pdb'), _protein_lines() + rows)
+
+        metadata = analyzer.analyze_structure(io.load_pdb(source))
+        self.assertEqual(metadata['heteroatoms'], ['LIG', 'SO4'])
+
+    def test_feature26_atom_breakdown_sums_to_total(self):
+        rows = [self._het(9100, 'C1', 'LIG', 'A', 800, 12.0, 'C'),
+                self._het(9103, 'O', 'HOH', 'A', 700, 40.0, 'O')]
+        source = _write(self.path('h.pdb'), _protein_lines() + rows)
+
+        metadata = analyzer.analyze_structure(io.load_pdb(source))
+        self.assertEqual(sum(metadata['atom_breakdown'].values()),
+                         metadata['atoms_total'])
+        self.assertEqual(metadata['atom_breakdown'],
+                         {'protein': len(_protein_lines()), 'water': 1,
+                          'heteroatom': 1})
+
+    def test_feature27_gap_reports_chain_from_to_and_size(self):
+        gapped = [l for l in _protein_lines() if not (20 <= int(l[22:26]) <= 24)]
+        source = _write(self.path('g.pdb'), gapped)
+
+        gaps = analyzer.analyze_structure(io.load_pdb(source))['sequence_gaps']
+        self.assertEqual(gaps, [{'chain': 'A', 'from': 19, 'to': 25,
+                                 'missing_count': 5}])
+
+    def test_feature27_no_false_positives(self):
+        """Insertion codes, interleaved ligands and negative numbering."""
+        lines = _protein_lines()
+
+        with_insertions = []
+        for line in lines:
+            with_insertions.append(line)
+            if int(line[22:26]) == 5:
+                with_insertions.append(line[:26] + 'A' + line[27:])
+        source = _write(self.path('ins.pdb'), with_insertions)
+        self.assertEqual(
+            analyzer.analyze_structure(io.load_pdb(source))['sequence_gaps'], [])
+
+        interleaved = list(lines)
+        interleaved.insert(10, self._het(9500, 'C1', 'LIG', 'A', 500, 50.0, 'C'))
+        source = _write(self.path('int.pdb'), interleaved)
+        self.assertEqual(
+            analyzer.analyze_structure(io.load_pdb(source))['sequence_gaps'], [])
+
+        shifted = [l[:22] + f'{int(l[22:26]) - 3:>4}' + l[26:] for l in lines]
+        source = _write(self.path('neg.pdb'), shifted)
+        self.assertEqual(
+            analyzer.analyze_structure(io.load_pdb(source))['sequence_gaps'], [])
+
+    def test_feature27_ensemble_does_not_duplicate_gaps(self):
+        gapped = [l for l in _protein_lines() if not (20 <= int(l[22:26]) <= 24)]
+        ensemble = []
+        for index in range(1, 4):
+            ensemble.append(f'MODEL     {index:>4}\n')
+            ensemble.extend(gapped)
+            ensemble.append('ENDMDL\n')
+        source = _write(self.path('e.pdb'), ensemble)
+
+        self.assertEqual(
+            len(analyzer.analyze_structure(io.load_pdb(source))['sequence_gaps']), 1)
+
+    def test_feature28_reports_chain_id_not_insert_position(self):
+        """
+        PDBFixer keys missingResidues by (chain index, insert position).
+        Reading that as (model, chain_id) reported an integer offset - for a
+        gap in the second chain it said chain 19 instead of chain B.
+        """
+        lines = _protein_lines()
+        seqres = self._seqres()
+        seqres_b = [l[:11] + 'B' + l[12:] for l in seqres]
+        chain_b = [l[:21] + 'B' + l[22:] for l in lines
+                   if not (20 <= int(l[22:26]) <= 24)]
+
+        source = _write(self.path('b.pdb'), seqres + seqres_b + lines + chain_b)
+        missing = analyzer.detect_missing_residues(source)
+
+        self.assertEqual(len(missing), 5)
+        self.assertEqual({m['chain'] for m in missing}, {'B'})
+        for entry in missing:
+            self.assertIsInstance(entry['residue'], str)
+            self.assertTrue(entry['residue'].isalpha())
+
+    def test_feature28_gaps_in_both_chains_attributed_separately(self):
+        lines = _protein_lines()
+        seqres = self._seqres()
+        seqres_b = [l[:11] + 'B' + l[12:] for l in seqres]
+        chain_a = [l for l in lines if not (5 <= int(l[22:26]) <= 7)]
+        chain_b = [l[:21] + 'B' + l[22:] for l in lines
+                   if not (20 <= int(l[22:26]) <= 24)]
+
+        source = _write(self.path('ab.pdb'),
+                        seqres + seqres_b + chain_a + chain_b)
+        missing = analyzer.detect_missing_residues(source)
+
+        counts = {}
+        for entry in missing:
+            counts[entry['chain']] = counts.get(entry['chain'], 0) + 1
+        self.assertEqual(counts, {'A': 3, 'B': 5})
+
+    def test_feature28_degrades_quietly(self):
+        gapped = [l for l in _protein_lines() if not (20 <= int(l[22:26]) <= 24)]
+        # No SEQRES: nothing to compare against.
+        self.assertEqual(
+            analyzer.detect_missing_residues(_write(self.path('n.pdb'), gapped)), [])
+        # Complete structure.
+        self.assertEqual(
+            analyzer.detect_missing_residues(
+                _write(self.path('f.pdb'), self._seqres() + _protein_lines())), [])
+        # Unreadable path must not raise.
+        self.assertEqual(
+            analyzer.detect_missing_residues(self.path('nope.pdb')), [])
+
+
 class TestSiteAnalyzer(TempDirTest):
 
     def _protonated(self):
