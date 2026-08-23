@@ -350,7 +350,70 @@ def transfer_conect_records(source_path, output_path):
     return len(bonds)
 
 
-def save_pdb(structure, output_path, select=None, conect_source=None):
+def transfer_header_records(source_path, output_path, records=('SEQRES',)):
+    """
+    Copy header records from ``source_path`` onto ``output_path``.
+
+    Biopython drops these on parse and PDBIO writes none, so a saved structure
+    carries no SEQRES. PDBFixer compares SEQRES against the observed residues
+    to work out what is missing, so without it loop reconstruction has nothing
+    to rebuild and silently does nothing.
+
+    SEQRES is filtered to the chains that survived into the output. Carrying
+    the sequence of a chain that was filtered out would make PDBFixer treat
+    that whole chain as missing and try to build it from nothing.
+
+    Returns the number of records written.
+    """
+    chains_present = set()
+    try:
+        with open(output_path, 'r') as fh:
+            for line in fh:
+                if line[:6] in ('ATOM  ', 'HETATM') and len(line) > 21:
+                    chains_present.add(line[21])
+    except OSError:
+        return 0
+    if not chains_present:
+        return 0
+
+    carried = []
+    try:
+        with open(source_path, 'r') as fh:
+            for line in fh:
+                name = line[:6].strip()
+                if name not in records:
+                    continue
+                if name == 'SEQRES':
+                    # Column 12 (index 11) holds the chain identifier.
+                    if len(line) > 11 and line[11] in chains_present:
+                        carried.append(line)
+                else:
+                    carried.append(line)
+    except OSError:
+        return 0
+
+    if not carried:
+        return 0
+
+    with open(output_path, 'r') as fh:
+        body = fh.readlines()
+
+    insert_at = len(body)
+    for index, line in enumerate(body):
+        if line[:6] in ('ATOM  ', 'HETATM', 'MODEL '):
+            insert_at = index
+            break
+
+    with open(output_path, 'w') as fh:
+        fh.writelines(body[:insert_at])
+        fh.writelines(carried)
+        fh.writelines(body[insert_at:])
+
+    return len(carried)
+
+
+def save_pdb(structure, output_path, select=None, source_pdb=None,
+             conect_source=None):
     """
     Save a Biopython Structure to a PDB file.
 
@@ -358,9 +421,12 @@ def save_pdb(structure, output_path, select=None, conect_source=None):
         structure (Structure): Biopython Structure object.
         output_path (str): Path to write the PDB file.
         select (Select, optional): Biopython Select used to filter atoms.
-        conect_source (str, optional): Path of the file the structure was read
-            from. Its CONECT records are carried onto the output, remapped to
-            the new atom numbering. Without this, bond records are lost.
+        source_pdb (str, optional): Path of the file the structure was read
+            from. Records Biopython discards on parse are carried onto the
+            output: CONECT bonds remapped to the new atom numbering, and
+            SEQRES for the chains that survived. Without it, ligand bonds and
+            the reference sequence are both lost.
+        conect_source (str, optional): Deprecated alias for ``source_pdb``.
     """
     parent = os.path.dirname(os.path.abspath(output_path))
     if parent:
@@ -373,5 +439,7 @@ def save_pdb(structure, output_path, select=None, conect_source=None):
     else:
         io.save(output_path)
 
-    if conect_source and os.path.exists(conect_source):
-        transfer_conect_records(conect_source, output_path)
+    origin = source_pdb or conect_source
+    if origin and os.path.exists(origin):
+        transfer_conect_records(origin, output_path)
+        transfer_header_records(origin, output_path)

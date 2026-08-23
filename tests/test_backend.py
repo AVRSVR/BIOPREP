@@ -315,6 +315,95 @@ class TestConectPreservation(TempDirTest):
                          'ligand connectivity lost somewhere in the pipeline')
 
 
+class TestSeqresPreservation(TempDirTest):
+    """
+    SEQRES must survive a save, or PDBFixer cannot tell what is missing.
+
+    Biopython drops it on parse and PDBIO writes none, so cleaning stripped it
+    before the protonator ran and loop reconstruction silently rebuilt nothing.
+    """
+
+    def _gapped(self):
+        with open(CRN) as fh:
+            seqres = [l for l in fh if l.startswith('SEQRES')]
+        kept = [l for l in _protein_lines() if not (20 <= int(l[22:26]) <= 24)]
+        return _write(self.path('gap.pdb'), seqres + kept)
+
+    @staticmethod
+    def _seqres_count(path):
+        return sum(1 for l in pathlib.Path(path).read_text().splitlines()
+                   if l.startswith('SEQRES'))
+
+    def test_seqres_carried_across_a_save(self):
+        source = self._gapped()
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'), source_pdb=source)
+
+        self.assertGreater(self._seqres_count(self.path('out.pdb')), 0)
+
+    def test_without_source_no_seqres_is_written(self):
+        source = self._gapped()
+        io.save_pdb(io.load_pdb(source), self.path('out.pdb'))
+        self.assertEqual(self._seqres_count(self.path('out.pdb')), 0)
+
+    def test_seqres_filtered_to_surviving_chains(self):
+        """
+        Carrying the sequence of a filtered-out chain would make PDBFixer treat
+        that whole chain as missing and try to build it from nothing.
+        """
+        with open(CRN) as fh:
+            seqres = [l for l in fh if l.startswith('SEQRES')]
+        seqres_b = [l[:11] + 'B' + l[12:] for l in seqres]
+        lines = _protein_lines()
+        source = _write(self.path('two.pdb'),
+                        seqres + seqres_b + lines
+                        + [l[:21] + 'B' + l[22:] for l in lines])
+
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure, target_chains=['A']),
+                    source_pdb=source)
+
+        carried = [l for l in pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+                   if l.startswith('SEQRES')]
+        self.assertTrue(carried)
+        self.assertEqual({l[11] for l in carried}, {'A'})
+
+    def test_loop_reconstruction_works_through_the_pipeline(self):
+        from bioprep.core.pipeline import PipelineSettings, prepare_structure
+
+        source = self._gapped()
+        workdir = self.path('work')
+        os.makedirs(workdir, exist_ok=True)
+
+        outcome = prepare_structure(
+            source, workdir,
+            PipelineSettings.from_mapping({'reconstruct_loops': True}),
+            original_filename='gap.pdb')
+
+        self.assertEqual(
+            outcome['report']['protonation']['loops_reconstructed'], 5,
+            'loops were not rebuilt - SEQRES probably did not survive cleaning')
+
+        written = {int(l[22:26]) for l in
+                   pathlib.Path(outcome['viewer_path']).read_text().splitlines()
+                   if l.startswith('ATOM')}
+        self.assertLessEqual({20, 21, 22, 23, 24}, written)
+
+    def test_loops_not_rebuilt_when_flag_is_off(self):
+        from bioprep.core.pipeline import PipelineSettings, prepare_structure
+
+        source = self._gapped()
+        workdir = self.path('work2')
+        os.makedirs(workdir, exist_ok=True)
+
+        outcome = prepare_structure(source, workdir,
+                                    PipelineSettings.from_mapping({}),
+                                    original_filename='gap.pdb')
+        self.assertEqual(
+            outcome['report']['protonation']['loops_reconstructed'], 0)
+
+
 class TestMmcifSupport(TempDirTest):
     """mmCIF input: RCSB serves it by default, so it must be accepted."""
 

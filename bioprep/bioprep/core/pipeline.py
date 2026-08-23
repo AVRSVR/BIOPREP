@@ -165,11 +165,12 @@ def prepare_structure(input_path, workdir, settings, original_filename=None):
         keep_structural_waters=settings.keep_structural_waters,
         protect_ligands=settings.protect_ligands,
     )
-    # conect_source carries the input's bond records onto the cleaned
-    # file. Biopython drops CONECT on parse, so without this the
-    # protonator's ligand-bond preservation has nothing left to preserve.
+    # source_pdb carries across what Biopython drops on parse: the input's
+    # CONECT bonds, so the protonator's ligand-bond preservation has something
+    # to preserve, and its SEQRES, without which PDBFixer cannot tell which
+    # residues are missing and loop reconstruction silently rebuilds nothing.
     save_pdb(structure, cleaned_path, select=select_obj,
-             conect_source=input_path)
+             source_pdb=input_path)
 
     if count_atoms_in_pdb(cleaned_path) == 0:
         raise ValueError(
