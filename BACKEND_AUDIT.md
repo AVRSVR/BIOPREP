@@ -200,3 +200,104 @@ Claims from `bioprep_deep_dive.md` / `bioprep_technical_pitch.md`.
 4. **B15, B17, B18, B19** — temp-file and concurrency hygiene, before any multi-user deployment.
 5. **B10–B14** — reported-number accuracy.
 6. Everything else.
+
+---
+
+## Feature catalogue verification — complete
+
+All 121 features from `bioprep_deep_dive.md` were checked against the running
+code, group by group, with an independent verification script per group.
+
+| Features | Module | Checks | Result |
+|---|---|---|---|
+| 1–4 | `io.py` | 29 (with 5–11) | fixed: empty-file guard, mmCIF, element column, CONECT |
+| 5–11 | `cleaner.py` | — | fixed: `OH2` water oxygens, case-insensitive names |
+| 12–22 | `protonator.py` | 28 | fixed: ligand status reason |
+| 23–28 | `analyzer.py` | 28 | no new defects |
+| 29–48 | `minimizer.py` | 52 | added: terminal repair, CPU platform, `converged` |
+| 49–69 | `site_analyzer.py` | 51 | no new defects |
+| 70–80 | `exporter.py`, `reporter.py` | 63 | no new defects |
+| 81–110 | `app.py` | 95 | fixed: SEQRES loss disabling loop reconstruction |
+| 111–112 | `cli.py` | 58 | fixed: mmCIF working directory leak |
+| 113–121 | frontend | 1 finding | contract drift, see below |
+
+**Total: 404 verification checks, 124 committed regression tests.**
+
+### Defects found and fixed
+
+Six produced wrong output with no error at all, which is the category that does
+real damage in a preparation tool:
+
+1. Two-character elements were written one column left of the spec, so a zinc
+   cofactor read back as nitrogen and iron as fluorine — in Biopython and
+   OpenMM alike.
+2. Structural-water detection matched only `O`, `OW`, `O1`, so CHARMM and NAMD
+   structures (`OH2`) had no detectable water oxygen and every water was
+   deleted despite the user asking to keep them.
+3. `--protect lig` failed to match `LIG` and the ligand was deleted by
+   `--remove-het ALL` without a word.
+4. CONECT records were dropped at the cleaning step, making the protonator's
+   ligand-bond preservation dead code.
+5. SEQRES was dropped at the same step, so PDBFixer could not tell which
+   residues were missing and `reconstruct_loops` rebuilt nothing whether it
+   was on or off.
+6. Non-PDB uploads blamed the chain-selection settings instead of the file.
+
+Plus: the minimizer's terminal-group repair, CPU platform preference and
+`converged` flag were absent; the ligand status report did not say why a ligand
+was skipped; and the CLI leaked a working directory on every mmCIF run.
+
+### Frontend contract (for the rewrite)
+
+`static/js/main.js` still reads the pre-rewrite report shape. The current
+`/api/process` response is:
+
+```
+{
+  success, filename, session_id,
+  viewer_pdb_b64,          # always a PDB, for the 3D viewer
+  pdb_b64,                 # the download; equals viewer_pdb_b64 unless a
+                           # docking export produced a different file
+  warnings: [str],
+  report_text: str,
+  report: {
+    generated_at, input_file,
+    chains: {detected: [], retained: []},
+    water_molecules_removed, water_molecules_retained,
+    heteroatoms: {removed: [], retained: []},
+    protonation: {
+      hydrogens_added: bool, ph: float,
+      ligands_preserved: [], ligand_status: [{residue, atoms, action, reason}],
+      nonstandard_replaced: [], loops_reconstructed: int
+    },
+    hydrogens_added: bool,          # kept at top level for older readers
+    protonation_ph: float,
+    missing_residues_detected: [{chain, residue, position}],
+    atom_counts: {before_processing, after_processing, delta},
+    warnings: [str],
+    energy_minimization: {          # present only when minimisation ran
+      status: 'full'|'partial'|'partial_no_implicit_solvent'|'failed',
+      force_field, gbsa_used,
+      energy_before_kJ_mol, energy_after_kJ_mol, delta_energy_kJ_mol,
+      energy_decreased: bool, converged: bool,
+      excluded_residues: [], terminals_repaired: bool,
+      iterations_max, energy_tolerance_kJ_mol_nm,
+      warnings: [], error: str|None
+    },
+    docking_export: {target, succeeded, error?},
+    docking_target,                 # only when succeeded
+    settings_used: {...},
+    processing_time_seconds
+  }
+}
+```
+
+Two changes the old frontend has not caught up with:
+
+- Energies are `float` or `None`, never the string `'N/A'`. `main.js` still
+  tests for `'N/A'`.
+- `iterations` was replaced by `iterations_max`; the actual iteration count is
+  not reported because OpenMM does not expose it.
+
+A returned file is never proof that minimisation ran — check
+`energy_minimization.status`.
