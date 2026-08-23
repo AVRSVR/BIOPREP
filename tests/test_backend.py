@@ -514,6 +514,118 @@ class TestWaterRemoval(TempDirTest):
         self.assertEqual(self._heteroatom_names(self.path('out.pdb')), [])
 
 
+class TestCleanerRules(TempDirTest):
+    """Features 6-11: structural waters, chain filtering, heteroatom rules."""
+
+    @staticmethod
+    def _het(serial, name, resn, chain, resseq, x, y, z, elem):
+        return (f'HETATM{serial:>5} {name:<4} {resn:>3} {chain:1}{resseq:>4}    '
+                f'{x:8.3f}{y:8.3f}{z:8.3f}  1.00 10.00          {elem:>2}  \n')
+
+    def _near_far_waters(self, oxygen_name):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        return _write(self.path('w.pdb'), lines + [
+            self._het(9100, oxygen_name, 'HOH', 'A', 750, x + 2.8, y, z, 'O'),
+            self._het(9101, oxygen_name, 'HOH', 'A', 751, x + 80, y, z, 'O'),
+        ])
+
+    def _kept_resseqs(self, path):
+        return sorted(int(l[22:26]) for l in pathlib.Path(path).read_text().splitlines()
+                      if l.startswith('HETATM'))
+
+    def _het_names(self, path):
+        return sorted({l[17:20].strip()
+                       for l in pathlib.Path(path).read_text().splitlines()
+                       if l.startswith('HETATM')})
+
+    def test_feature6_water_oxygen_naming_conventions(self):
+        """
+        Crystallographic files use O, GROMACS uses OW, CHARMM uses OH2. Matching
+        a fixed name list meant CHARMM waters had no detectable oxygen, so
+        structural-water preservation kept nothing at all.
+        """
+        for oxygen in ('O', 'OW', 'OH2', 'O1'):
+            with self.subTest(oxygen=oxygen):
+                source = self._near_far_waters(oxygen)
+                structure = io.load_pdb(source)
+                io.save_pdb(structure, self.path('out.pdb'),
+                            select=cleaner.clean_structure(
+                                structure, remove_water=True,
+                                keep_structural_waters=True))
+                self.assertEqual(self._kept_resseqs(self.path('out.pdb')), [750])
+
+    def test_feature6_distant_water_is_removed(self):
+        source = self._near_far_waters('O')
+        structure = io.load_pdb(source)
+        select = cleaner.clean_structure(structure, remove_water=True,
+                                         keep_structural_waters=True)
+        self.assertEqual(len(select.structural_waters), 1)
+
+    def test_feature7_chain_selection_keeps_only_that_chain(self):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        both = lines + [l[:21] + 'B' + l[22:] for l in lines] + [
+            self._het(9200, 'C1', 'LIG', 'A', 800, x, y, z, 'C'),
+            self._het(9201, 'C1', 'LIG', 'B', 800, x, y, z, 'C'),
+        ]
+        source = _write(self.path('ch.pdb'), both)
+
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure, target_chains=['A']))
+
+        text = pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+        chains = {l[21] for l in text if l.startswith(('ATOM', 'HETATM'))}
+        self.assertEqual(chains, {'A'})
+
+    def _mixed(self):
+        lines = _protein_lines()
+        x, y, z = _first_ca_xyz(lines)
+        return _write(self.path('m.pdb'), lines + [
+            self._het(9300, 'C1', 'LIG', 'A', 800, x + 10, y, z, 'C'),
+            self._het(9301, 'S', 'SO4', 'A', 801, x + 14, y, z, 'S'),
+            self._het(9302, 'ZN', ' ZN', 'A', 802, x + 18, y, z, 'ZN'),
+        ])
+
+    def _clean(self, **kwargs):
+        source = self._mixed()
+        structure = io.load_pdb(source)
+        io.save_pdb(structure, self.path('out.pdb'),
+                    select=cleaner.clean_structure(structure, **kwargs))
+        return self._het_names(self.path('out.pdb'))
+
+    def test_feature8_selective_removal(self):
+        self.assertEqual(self._clean(remove_heteroatoms=['SO4']), ['LIG', 'ZN'])
+
+    def test_feature9_remove_all_heteroatoms(self):
+        self.assertEqual(self._clean(remove_heteroatoms=['ALL']), [])
+
+    def test_feature10_unlisted_heteroatoms_are_kept(self):
+        self.assertEqual(self._clean(remove_heteroatoms=[]), ['LIG', 'SO4', 'ZN'])
+
+    def test_residue_names_are_matched_case_insensitively(self):
+        """A lower-case entry used to silently fail to match."""
+        self.assertEqual(self._clean(remove_heteroatoms=['so4']), ['LIG', 'ZN'])
+        self.assertEqual(self._clean(remove_heteroatoms=['  Zn ']), ['LIG', 'SO4'])
+        self.assertEqual(self._clean(remove_heteroatoms=['all']), [])
+
+    def test_lowercase_protect_ligands_still_protects(self):
+        """The dangerous case: the ligand was deleted without a word."""
+        self.assertEqual(
+            self._clean(remove_heteroatoms=['ALL'], protect_ligands=['lig']),
+            ['LIG'])
+
+    def test_feature11_is_a_biopython_select_subclass(self):
+        from Bio.PDB import Select
+
+        select = cleaner.clean_structure(io.load_pdb(CRN))
+        self.assertIsInstance(select, Select)
+        self.assertIsInstance(select, cleaner.BioPrepSelect)
+        for method in ('accept_model', 'accept_chain', 'accept_residue', 'accept_atom'):
+            self.assertTrue(hasattr(select, method))
+
+
 class TestProtonator(TempDirTest):
 
     def test_b7_a9_ligand_held_out_and_status_reported(self):

@@ -3,6 +3,25 @@ from Bio.PDB import Select, NeighborSearch
 from .residues import is_water
 
 
+def _normalise_names(names):
+    """Upper-case and strip a list of residue names for comparison."""
+    return [str(name).strip().upper() for name in (names or []) if str(name).strip()]
+
+
+def _is_water_oxygen(atom):
+    """
+    True for the oxygen of a water molecule, whatever it is called.
+
+    Crystallographic waters use O; GROMACS uses OW; CHARMM and NAMD use OH2.
+    Matching a fixed list of names meant a CHARMM-derived structure had no
+    detectable water oxygen at all, so structural-water preservation silently
+    kept nothing and every water was deleted.
+    """
+    if (atom.element or '').strip().upper() == 'O':
+        return True
+    return atom.get_name().strip().upper().startswith('O')
+
+
 def _is_water_residue(residue):
     """
     True for any water, however it is named.
@@ -25,11 +44,15 @@ class BioPrepSelect(Select):
         self._first_model_id = first_model_id
         self.target_chains = target_chains if target_chains else []
         self.remove_water = remove_water
-        self.remove_heteroatoms = remove_heteroatoms if remove_heteroatoms else []
+        # Residue names are compared case-insensitively. PDB files use upper
+        # case, but a name typed by hand on the CLI may not be, and a lower
+        # case entry in protect_ligands used to silently fail to match - so a
+        # ligand the user had asked to keep was deleted without a word.
+        self.remove_heteroatoms = _normalise_names(remove_heteroatoms)
         self.keep_structural_waters = keep_structural_waters
         # Keys are (chain_id, residue.id) — residue ids repeat across chains.
         self.structural_waters = structural_waters if structural_waters else set()
-        self.protect_ligands = protect_ligands if protect_ligands else []
+        self.protect_ligands = _normalise_names(protect_ligands)
 
     def accept_model(self, model):
         # Write only the first model. NMR ensembles otherwise emit every model,
@@ -56,7 +79,7 @@ class BioPrepSelect(Select):
         # Biopython heteroatoms have id[0] NOT starting with a space ' '
         # (Standard residues are ' ', waters are 'W', heteroatoms are 'H_xxx')
         if hetfield != ' ':
-            res_name = residue.resname.strip()
+            res_name = residue.resname.strip().upper()
 
             # An explicitly protected ligand outranks every removal rule,
             # including 'ALL'. Without this, "remove all heteroatoms" silently
@@ -116,8 +139,7 @@ def clean_structure(structure, target_chains=None, remove_water=True, remove_het
             ns = NeighborSearch(protein_atoms)
             for chain_id, water_res in water_residues:
                 for w_atom in water_res.get_atoms():
-                    # Standard water oxygen is usually 'O' or 'OW'
-                    if w_atom.get_name() in ('O', 'OW', 'O1'):
+                    if _is_water_oxygen(w_atom):
                         nearby_protein_atoms = ns.search(w_atom.get_coord(), 4.0)
                         if nearby_protein_atoms:
                             # Qualify by chain: residue ids repeat across chains,
