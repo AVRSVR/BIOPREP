@@ -29,7 +29,6 @@
       <button class="nav-item active" data-view="prepare"><span class="nav-dot"></span>Prepare</button>
       <button class="nav-item" data-view="sites"><span class="nav-dot"></span>Binding sites</button>
       <button class="nav-item" data-view="batch"><span class="nav-dot"></span>Batch</button>
-      <button class="nav-item" data-view="throughput"><span class="nav-dot"></span>High-throughput</button>
       <button class="nav-item" data-view="history"><span class="nav-dot"></span>History</button>
       <button class="nav-item" data-view="templates"><span class="nav-dot"></span>Templates</button>
     </nav>
@@ -267,7 +266,7 @@
     <section class="view" id="view-batch">
       <div class="view-header">
         <h1 class="view-title">Batch processing</h1>
-        <p class="view-desc">Apply one set of options to several structures. Returns a zip with each result and a combined report.</p>
+        <p class="view-desc">Apply one set of options to several structures at once. Drop individual .pdb files, or a single .zip archive for larger collections (up to 500 files). Returns a zip with each result and a combined report.</p>
       </div>
 
       <div class="grid-2">
@@ -277,9 +276,9 @@
               <path d="M12 3v12m0-12 4 4m-4-4-4 4"/>
               <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
             </svg>
-            <div class="dropzone-title">Drop multiple .pdb files</div>
+            <div class="dropzone-title">Drop .pdb files, or a single .zip archive</div>
             <div class="dropzone-hint">Or click to browse</div>
-            <input type="file" id="batch-file-input" accept=".pdb" multiple>
+            <input type="file" id="batch-file-input" accept=".pdb,.zip" multiple>
           </div>
           <div id="batch-file-list" class="stack" style="gap:4px"></div>
         </div>
@@ -288,34 +287,6 @@
           <div class="panel-title">Settings</div>
           <div id="batch-settings"></div>
           <button class="btn btn-primary btn-block" id="batch-run-btn" style="margin-top:var(--space-4)" disabled>Run batch</button>
-        </div>
-      </div>
-    </section>
-
-    <!-- ─────────────────────────────────────────── THROUGHPUT ───── -->
-    <section class="view" id="view-throughput">
-      <div class="view-header">
-        <h1 class="view-title">High-throughput pipeline</h1>
-        <p class="view-desc">Upload a zip archive of structures. Supports large collections.</p>
-      </div>
-
-      <div class="grid-2">
-        <div class="stack">
-          <div class="dropzone" id="ht-dropzone">
-            <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="4" y="4" width="16" height="16" rx="1.5"/><path d="M4 9h16M9 4v16"/>
-            </svg>
-            <div class="dropzone-title">Drop a .zip archive</div>
-            <div class="dropzone-hint">Or click to browse</div>
-            <input type="file" id="ht-file-input" accept=".zip">
-          </div>
-          <span class="file-chip hidden" id="ht-file-chip"></span>
-        </div>
-
-        <div class="panel">
-          <div class="panel-title">Settings</div>
-          <div id="ht-settings"></div>
-          <button class="btn btn-primary btn-block" id="ht-run-btn" style="margin-top:var(--space-4)" disabled>Run pipeline</button>
         </div>
       </div>
     </section>
@@ -338,7 +309,7 @@
     <section class="view" id="view-templates">
       <div class="view-header">
         <h1 class="view-title">Templates</h1>
-        <p class="view-desc">Saved parameter presets for the Prepare, Batch and High-throughput panels.</p>
+        <p class="view-desc">Saved parameter presets for the Prepare panel.</p>
       </div>
       <div id="templates-content"></div>
     </section>

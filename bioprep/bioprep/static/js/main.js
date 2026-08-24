@@ -150,7 +150,7 @@
     } catch (_) { /* decorative only */ }
   }
 
-  // ── shared settings panel (used by Batch and High-throughput) ───────
+  // ── shared settings panel (used by Batch) ────────────────────────────
 
   function buildSettingsPanel(container, idPrefix) {
     container.innerHTML = `
@@ -718,26 +718,53 @@
 
   // ══════════════════════════════════════════════════════ BATCH ═══════
 
+  // Accepts either a handful of individual PDBs or one zip archive — same
+  // pipeline underneath (/api/batch vs /api/high-throughput), the only
+  // difference is how the structures arrive. The two inputs are mutually
+  // exclusive: dropping one clears the other, rather than trying to submit
+  // both in the same request.
   const Batch = (() => {
     let files = [];
+    let zipFile = null;
 
     function renderFileList() {
       const listEl = qs("#batch-file-list");
       listEl.innerHTML = "";
-      files.forEach((f, i) => {
+
+      if (zipFile) {
         const row = el("div", "file-chip");
         row.style.display = "inline-flex";
-        row.innerHTML = `${escapeHtml(f.name)} <button data-i="${i}" title="Remove">${ICON.x}</button>`;
-        row.querySelector("button").addEventListener("click", () => {
-          files.splice(i, 1); renderFileList();
-        });
+        row.innerHTML = `${escapeHtml(zipFile.name)} <span class="badge badge-neutral">zip</span> <button title="Remove">${ICON.x}</button>`;
+        row.querySelector("button").addEventListener("click", () => { zipFile = null; renderFileList(); });
         listEl.appendChild(row);
-      });
-      qs("#batch-run-btn").disabled = files.length === 0;
+      } else {
+        files.forEach((f, i) => {
+          const row = el("div", "file-chip");
+          row.style.display = "inline-flex";
+          row.innerHTML = `${escapeHtml(f.name)} <button data-i="${i}" title="Remove">${ICON.x}</button>`;
+          row.querySelector("button").addEventListener("click", () => {
+            files.splice(i, 1); renderFileList();
+          });
+          listEl.appendChild(row);
+        });
+      }
+      qs("#batch-run-btn").disabled = !zipFile && files.length === 0;
     }
 
     function onFilesChosen(chosen) {
-      files = files.concat(chosen);
+      const zips = chosen.filter((f) => f.name.toLowerCase().endsWith(".zip"));
+      const pdbs = chosen.filter((f) => !f.name.toLowerCase().endsWith(".zip"));
+
+      if (zips.length) {
+        if (zips.length > 1 || pdbs.length) {
+          toast("Only the zip archive was used — batch takes individual PDBs or one zip, not both.", "rust");
+        }
+        zipFile = zips[0];
+        files = [];
+      } else if (pdbs.length) {
+        zipFile = null;
+        files = files.concat(pdbs);
+      }
       renderFileList();
     }
 
@@ -749,15 +776,23 @@
 
       const settings = readSettingsPanel("batch");
       const config = { ...settings, ph: settings.ph };
-      const form = new FormData();
-      files.forEach((f) => form.append("files", f));
-      form.append("config", JSON.stringify(config));
 
       try {
-        const res = await api("/api/batch", { method: "POST", body: form });
-        const blob = await res.blob();
+        let blob;
+        if (zipFile) {
+          const form = new FormData();
+          form.append("file", zipFile);
+          form.append("config", JSON.stringify(config));
+          blob = await (await api("/api/high-throughput", { method: "POST", body: form })).blob();
+          toast("Batch complete — zip archive submitted", "moss");
+        } else {
+          const form = new FormData();
+          files.forEach((f) => form.append("files", f));
+          form.append("config", JSON.stringify(config));
+          blob = await (await api("/api/batch", { method: "POST", body: form })).blob();
+          toast(`Batch complete — ${files.length} file(s) submitted`, "moss");
+        }
         downloadBlob(blob, "bioprep_batch_results.zip");
-        toast(`Batch complete — ${files.length} file(s) submitted`, "moss");
       } catch (err) {
         toast(err.message, "rust");
       } finally {
@@ -770,59 +805,6 @@
       buildSettingsPanel(qs("#batch-settings"), "batch");
       wireDropzone(qs("#batch-dropzone"), qs("#batch-file-input"), onFilesChosen);
       qs("#batch-run-btn").addEventListener("click", run);
-    }
-
-    return { init };
-  })();
-
-  // ══════════════════════════════════════════════════ HIGH-THROUGHPUT ═
-
-  const Throughput = (() => {
-    let zipFile = null;
-
-    function onFileChosen(file) {
-      zipFile = file;
-      qs("#ht-file-chip").classList.remove("hidden");
-      qs("#ht-file-chip").innerHTML =
-        `${escapeHtml(file.name)} <button id="ht-file-clear" title="Remove">${ICON.x}</button>`;
-      qs("#ht-file-clear").addEventListener("click", () => {
-        zipFile = null;
-        qs("#ht-file-chip").classList.add("hidden");
-        qs("#ht-file-input").value = "";
-        qs("#ht-run-btn").disabled = true;
-      });
-      qs("#ht-run-btn").disabled = false;
-    }
-
-    async function run() {
-      if (!zipFile) return;
-      const btn = qs("#ht-run-btn");
-      btn.disabled = true;
-      const original = btn.textContent;
-      btn.innerHTML = '<span class="spinner"></span> Running…';
-
-      const settings = readSettingsPanel("ht");
-      const form = new FormData();
-      form.append("file", zipFile);
-      form.append("config", JSON.stringify(settings));
-
-      try {
-        const res = await api("/api/high-throughput", { method: "POST", body: form });
-        const blob = await res.blob();
-        downloadBlob(blob, "bioprep_ht_results.zip");
-        toast("High-throughput run complete", "moss");
-      } catch (err) {
-        toast(err.message, "rust");
-      } finally {
-        btn.disabled = false;
-        btn.textContent = original;
-      }
-    }
-
-    function init() {
-      buildSettingsPanel(qs("#ht-settings"), "ht");
-      wireDropzone(qs("#ht-dropzone"), qs("#ht-file-input"), onFileChosen);
-      qs("#ht-run-btn").addEventListener("click", run);
     }
 
     return { init };
@@ -973,7 +955,6 @@
     Prepare.init();
     Sites.init();
     Batch.init();
-    Throughput.init();
     initHeroViewer();
   });
 })();
