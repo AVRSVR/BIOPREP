@@ -79,16 +79,37 @@ class BioPrepSelect(Select):
         return 1 if model.id == self._first_model_id else 0
 
     def accept_chain(self, chain):
-        if self.target_chains and chain.id not in self.target_chains:
-            return 0
+        # Always accept at this level. Select's accept_chain is an all-or-
+        # nothing gate - returning 0 here means accept_residue is never even
+        # called for anything in the chain, which made target_chains outrank
+        # protect_ligands rather than the other way round. A co-crystallised
+        # ligand is routinely recorded under a different chain letter than
+        # the receptor: HIV protease's inhibitor sits on chain B of an A/B
+        # dimer. Selecting chains=['A'] silently dropped it even with the
+        # ligand explicitly protected, because the chain gate ran first and
+        # accept_residue's protection check never got the chance to fire.
+        # The actual chain decision now happens per residue, below.
         return 1
 
     def accept_residue(self, residue):
         hetfield = residue.id[0]
         chain_id = residue.get_parent().id
+        is_water = _is_water_residue(residue)
+
+        # An explicitly protected ligand survives regardless of which chain
+        # it is recorded under. Chain selection targets the receptor; a bound
+        # ligand naming itself distinct from the protein is exactly the case
+        # protect_ligands exists for, so requiring target_chains membership
+        # as well would make "protect this ligand" an unreliable promise.
+        if hetfield != ' ' and not is_water:
+            if residue.resname.strip().upper() in self.protect_ligands:
+                return 1
+
+        if self.target_chains and chain_id not in self.target_chains:
+            return 0
 
         # 1. Handle Water
-        if _is_water_residue(residue):
+        if is_water:
             if self.keep_structural_waters and (chain_id, residue.id) in self.structural_waters:
                 return 1
             return 0 if self.remove_water else 1
@@ -98,12 +119,6 @@ class BioPrepSelect(Select):
         # (Standard residues are ' ', waters are 'W', heteroatoms are 'H_xxx')
         if hetfield != ' ':
             res_name = residue.resname.strip().upper()
-
-            # An explicitly protected ligand outranks every removal rule,
-            # including 'ALL'. Without this, "remove all heteroatoms" silently
-            # deleted ligands the user had asked to keep.
-            if res_name in self.protect_ligands:
-                return 1
 
             # If user selected "Remove ALL Heteros"
             if 'ALL' in self.remove_heteroatoms:

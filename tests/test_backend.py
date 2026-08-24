@@ -629,6 +629,54 @@ class TestCleanerRules(TempDirTest):
                        for l in pathlib.Path(path).read_text().splitlines()
                        if l.startswith('HETATM')})
 
+    def test_protected_ligand_survives_on_an_unselected_chain(self):
+        """
+        Select's accept_chain is an all-or-nothing gate: returning 0 skips
+        accept_residue entirely for everything in that chain, so target_chains
+        used to outrank protect_ligands rather than the other way round. A
+        co-crystallised ligand routinely sits on a different chain letter than
+        the receptor - HIV-1 protease's inhibitor is chain B of an A/B dimer -
+        so selecting chains=['A'] silently dropped a ligand the user had
+        explicitly protected, with no warning: the report just showed
+        ligands_preserved as empty.
+        """
+        lines_a = _protein_lines()
+        x, y, z = _first_ca_xyz(lines_a)
+        lines_b = [l[:21] + 'B' + l[22:] for l in lines_a]
+        ligand_on_b = self._het(9500, 'C1', 'LIG', 'B', 900, x + 6, y, z, 'C')
+        source = _write(self.path('two_chain.pdb'), lines_a + lines_b + [ligand_on_b])
+
+        structure = io.load_pdb(source)
+        select = cleaner.clean_structure(
+            structure, target_chains=['A'], remove_heteroatoms=['ALL'],
+            protect_ligands=['LIG'])
+        io.save_pdb(structure, self.path('out.pdb'), select=select)
+
+        written = pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+        ligand_atoms = [l for l in written if l[17:20].strip() == 'LIG']
+        self.assertTrue(ligand_atoms, 'protected ligand on chain B was dropped')
+        self.assertEqual(ligand_atoms[0][21], 'B',
+                         'ligand chain id was rewritten rather than preserved')
+
+        protein_chains = {l[21] for l in written if l.startswith('ATOM')}
+        self.assertEqual(protein_chains, {'A'},
+                         'chain B protein leaked through along with its ligand')
+
+    def test_unprotected_heteroatom_on_an_unselected_chain_still_dropped(self):
+        """The fix must not accidentally let every off-chain heteroatom through."""
+        lines_a = _protein_lines()
+        x, y, z = _first_ca_xyz(lines_a)
+        lines_b = [l[:21] + 'B' + l[22:] for l in lines_a]
+        ligand_on_b = self._het(9500, 'S', 'SO4', 'B', 900, x + 6, y, z, 'S')
+        source = _write(self.path('two_chain.pdb'), lines_a + lines_b + [ligand_on_b])
+
+        structure = io.load_pdb(source)
+        select = cleaner.clean_structure(structure, target_chains=['A'])
+        io.save_pdb(structure, self.path('out.pdb'), select=select)
+
+        written = pathlib.Path(self.path('out.pdb')).read_text()
+        self.assertNotIn('SO4', written)
+
     def test_feature6_water_oxygen_naming_conventions(self):
         """
         Crystallographic files use O, GROMACS uses OW, CHARMM uses OH2. Matching

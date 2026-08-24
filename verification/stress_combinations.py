@@ -194,8 +194,14 @@ if response.status_code == 200:
     viewer = decode(body["viewer_pdb_b64"])
     zinc = atom_lines(viewer, "ZN")
     check("3", "zinc retained", bool(zinc), f"{len(zinc)} atoms")
-    check("3", "zinc element still reads ZN",
-          all(l[76:78].strip() == "ZN" for l in zinc),
+    # Case-insensitive on purpose. RCSB and our own Biopython-path writer use
+    # 'ZN'; OpenMM's own PDBFile.writeFile (used for every post-minimisation
+    # file) writes 'Zn'. Both identify the same element correctly to every
+    # tool that reads this file - documented as a minor known inconsistency,
+    # not chased further, unlike the earlier column-offset bug that actually
+    # changed the identified element.
+    check("3", "zinc element still identifies as Zn/ZN",
+          all(l[76:78].strip().upper() == "ZN" for l in zinc),
           str({l[76:78] for l in zinc}))
     mini = body["report"].get("energy_minimization") or {}
     check("3", "minimisation ran with a metal present",
