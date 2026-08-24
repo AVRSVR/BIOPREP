@@ -380,3 +380,59 @@ live in the browser.
 - **The drugability score is an unvalidated heuristic.** On 1HSG the real inhibitor site is found (6.2 Å, largest volume, lined by the catalytic Asp dyad and flap) but ranks **last of five**: the volume term penalises it for exceeding 300–1000 Å³ and concavity for being an open cavity — the very properties that let it bind a peptidomimetic. Two of the five factors, property diversity and pharmacophore density, are 1.00 for every pocket and do no discriminating work. The five sub-scores are returned per pocket so the ranking can be argued with; the weights were deliberately **not** retuned, since fitting them to two structures would be overfitting dressed as improvement.
 - **Ligands are never parameterised.** Tier 2 excludes them rather than generating GAFF or CGenFF parameters, so a ligand's internal geometry is never optimised.
 - **The element column's case is inconsistent between writers.** RCSB and our own `SpecCompliantPDBIO` write `ZN`; OpenMM's own `PDBFile.writeFile`, used for every post-protonation and post-minimisation file, writes `Zn`. Both identify the correct element to every tool checked (OpenMM, OpenBabel), unlike the earlier column-offset bug that actually changed which element was read. Left alone rather than post-processing every OpenMM-written file to re-case a column that nothing downstream cares about.
+
+## Performance: GPU-accelerated minimisation
+
+`minimizer._make_simulation()` previously always ran on the CPU platform,
+deliberately, "for reproducible results." That was a real trade being made
+silently — this section makes it explicit and revisits it.
+
+**What changed.** The platform selection is now a cascade: CUDA, then
+OpenCL, then CPU, then whichever platform OpenMM picks by default. Each tier
+is a real `Simulation` (i.e. `Context`) construction attempt, not a name
+check — `Platform.getPlatformByName('OpenCL')` succeeding proves nothing;
+construction is where a misconfigured or absent device actually fails, and
+that failure now falls through to the next tier instead of raising. The
+platform actually used is threaded back through `_run()` into the report as
+`energy_minimization.platform`, so a result says what ran it rather than
+leaving that invisible.
+
+**Measured, not assumed.** On this project's own dev machine — an NVIDIA
+GTX 1650 with no CUDA build of OpenMM installed, only `Reference`, `CPU` and
+`OpenCL` available — a 642-atom system (protonated 1CRN) minimised in 18.0s
+on CPU versus 4.8s on OpenCL: a 3.8x wall-clock speedup. Correctness was
+checked, not assumed: identical starting energy, final energies within 2
+kJ/mol of each other (-5158.8 CPU vs -5160.7 OpenCL), mean atom position
+deviation of 0.011 Å and a maximum of 0.075 Å against the CPU result — both
+far below anything this tool treats as structurally meaningful anywhere
+else (compare the 2.17–2.45 Å pocket-collapse numbers earlier in this
+document). On a real, much larger job — PLD-fold vaccinia virus
+endonuclease K4 (`30IE`, chains G+H only, 6,762 atoms after cleaning) with
+every option on (loop reconstruction, missing atoms, minimisation, GBSA,
+structural waters, Vina export) — the identical run that had not finished
+after 70+ minutes on the old CPU-only code completed in **95.9 s** once
+restarted on the new cascade, which picked OpenCL: energy went from
++1,034,610 to -117,813 kJ/mol, RMS force 5.612 (converged), and the PDBQT
+export still succeeded.
+
+**The trade being made.** CPU was chosen originally for determinism — the
+same input always minimises to the same output, regardless of which machine
+runs it. That guarantee is now gone: two machines (or the same machine on
+different days, if driver/platform availability changes) can each minimise
+the same input to a slightly different local geometry, for the reason
+measured above — a few hundredths of an Å, not something anything
+downstream distinguishes, but no longer bit-identical either. Anyone who
+specifically needs bit-reproducible output across runs can set
+`BIOPREP_MINIMIZER_PLATFORM=CPU` to pin it back down; nothing in the product
+surfaces this yet.
+
+**A real, separate cost this uncovered.** GPU context creation and kernel
+compilation carry fixed overhead per `Simulation`, which a large production
+job amortises easily but a test suite that constructs dozens of tiny
+minimisations does not: the full suite went from ~100s to 514s, then 700s,
+purely from GPU tiers being attempted (and, on this occasion, mis-measured
+further by unrelated CPU contention from another process on the same
+machine). Fixed by having the test suite set
+`BIOPREP_MINIMIZER_PLATFORM=CPU` itself (`tests/conftest.py`), with one test
+explicitly clearing that pin to verify the real cascade order still works
+end to end rather than trusting a docstring's claim about it.

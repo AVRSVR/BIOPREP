@@ -17,3 +17,12 @@ for path in (PROJECT,):
     if path in sys.path:
         sys.path.remove(path)
     sys.path.insert(0, path)
+
+# minimizer._make_simulation() prefers a GPU platform (see its docstring for
+# why). GPU context creation and kernel compilation cost real fixed time per
+# Simulation, though - a win for one real job, but a 5x slowdown across a
+# suite that minimizes tiny fixtures thirty-odd times over (measured: 104s ->
+# 514s on this machine). Tests care about the science being correct, not
+# which hardware ran it, so default the suite to CPU; a test that wants to
+# exercise the real cascade clears this itself for its own duration.
+os.environ.setdefault('BIOPREP_MINIMIZER_PLATFORM', 'CPU')
