@@ -1,584 +1,347 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BioPrep Pro – Protein Preparation Platform</title>
-    <meta name="description"
-        content="Intelligent protein structure preparation for docking, MD simulations, and drug discovery.">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
-        rel="stylesheet">
-    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BioPrep</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<script src="https://3Dmol.org/build/3Dmol-min.js" defer></script>
 </head>
-
 <body>
-    <div class="bg-shape shape1"></div>
-    <div class="bg-shape shape2"></div>
-    <div class="bg-shape shape3"></div>
 
-    <div class="app-shell">
+<div class="app">
 
-        <!-- ── HEADER ──────────────────────────────────────────── -->
-        <header class="app-header">
-            <div class="logo">
-                <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="url(#hdr-grad)" stroke-width="2"
-                    stroke-linecap="round" stroke-linejoin="round">
-                    <defs>
-                        <linearGradient id="hdr-grad" x1="0%" y1="0%" x2="100%" y2="100%">
-                            <stop offset="0%" stop-color="#4facfe" />
-                            <stop offset="100%" stop-color="#00f2fe" />
-                        </linearGradient>
-                    </defs>
-                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-                </svg>
-                <span class="logo-text">BioPrep <em>Pro</em></span>
-            </div>
-            <nav class="mode-tabs" role="tablist">
-                <button class="tab-btn active" data-tab="precision" role="tab" id="tab-precision">⚗️ Precision</button>
-                <button class="tab-btn" data-tab="batch" role="tab" id="tab-batch">📦 Batch</button>
-                <button class="tab-btn" data-tab="highthroughput" role="tab" id="tab-ht">🚀 High-Throughput</button>
-                <button class="tab-btn" data-tab="site" role="tab" id="tab-site">🧬 Site Analyzer</button>
-                <button class="tab-btn" data-tab="history" role="tab" id="tab-history">📜 History</button>
-            </nav>
-            <div class="header-actions">
-                <span class="muted" style="font-size:.8rem;">Intelligent Protein Preparation</span>
-            </div>
-        </header>
-
-        <!-- ── MAIN CONTENT ────────────────────────────────────── -->
-        <main class="app-main">
-            <!-- ── TABS (Left Column) ──────────────────────────────── -->
-            <div class="tabs-column">
-                <!-- ── PRECISION TAB ───────────────────────────────────── -->
-                <div class="tab-content active" id="tab-panel-precision">
-                    <aside class="controls-panel glass-panel">
-                        <div id="step-1-precision">
-                            <div class="section-header">
-                                <h2>1. Upload Structure</h2>
-                            </div>
-                            <label for="file-input-precision" class="upload-zone" id="drop-zone-precision">
-                                <svg class="upload-icon" width="40" height="40" viewBox="0 0 24 24" fill="none"
-                                    stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                    <polyline points="17 8 12 3 7 8" />
-                                    <line x1="12" y1="3" x2="12" y2="15" />
-                                </svg>
-                                <h3>Click here to browse for a PDB file</h3>
-                                <p>or drag & drop a .pdb file onto this area</p>
-                                <input type="file" id="file-input-precision" accept=".pdb" style="display:none">
-                                <div id="file-name-precision" class="file-tag hidden"></div>
-                            </label>
-                        </div>
-
-                        <div id="step-2-precision" class="hidden">
-                            <div class="section-header">
-                                <h2>2. Configure</h2>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Chain Selection</label>
-                                <div class="checkbox-group" id="chains-container"></div>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Water Molecules</label>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="remove-waters" checked>
-                                    <label for="remove-waters">Remove <span id="water-count" class="badge">0</span>
-                                        waters</label>
-                                </div>
-                                <div class="toggle-row sub-toggle" id="structural-water-row">
-                                    <input type="checkbox" id="keep-structural-waters" checked>
-                                    <label for="keep-structural-waters">🔬 Smart Keep bridging waters (&lt;4Å)</label>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Heteroatoms &amp; Ligands <span class="chip chip-orange">SELECT ACTION</span></label>
-                                <p class="field-hint">Tick ✅ to <strong>KEEP</strong> a molecule &mdash; untick to
-                                    <strong>REMOVE</strong> it.
-                                </p>
-                                <div class="checkbox-group" id="heteros-container">
-                                    <p class="empty-msg">No heteroatoms detected.</p>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Target pH (Protonation)</label>
-                                <div class="slider-row">
-                                    <input type="range" id="ph-slider" min="1.0" max="14.0" step="0.1" value="7.4">
-                                    <span id="ph-val" class="ph-badge">7.4</span>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Structure Repair (PDBFixer) <span class="chip chip-blue">PRO</span></label>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="add-missing-atoms">
-                                    <label for="add-missing-atoms">Fill missing heavy atoms</label>
-                                </div>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="reconstruct-loops">
-                                    <label for="reconstruct-loops">Reconstruct missing loops</label>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Energy Minimization <span class="chip chip-orange">OPTIONAL</span></label>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="run-minimization">
-                                    <label for="run-minimization">Run minimization</label>
-                                </div>
-                                <div class="sub-settings" id="mini-settings" style="display:none;">
-                                    <select id="force-field-select" class="styled-select">
-                                        <option value="amber14">AMBER14</option>
-                                        <option value="charmm36">CHARMM36</option>
-                                    </select>
-                                    <div class="toggle-row mt-sm" style="margin-top: 0.5rem;">
-                                        <input type="checkbox" id="use-gbsa" checked>
-                                        <label for="use-gbsa" title="Generalized Born Surface Area - simulates water environment for more realistic results">Use GBSA Solvent</label>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Docking-Ready Export <span class="chip chip-purple">NEW</span></label>
-                                <div class="radio-group">
-                                    <label><input type="radio" name="docking" value=""> None (standard PDB)</label>
-                                    <label><input type="radio" name="docking" value="autodock"> AutoDock</label>
-                                    <label><input type="radio" name="docking" value="vina"> AutoDock Vina</label>
-                                    <label><input type="radio" name="docking" value="gromacs"> GROMACS</label>
-                                </div>
-                            </div>
-
-                            <div class="form-group">
-                                <label>Preparation Templates <span class="chip chip-blue">PRESET</span></label>
-                                <p class="field-hint">Save all current settings as a named preset, then reload them any time
-                                    from the dropdown.</p>
-                                <div class="template-row">
-                                    <select id="template-select" class="styled-select" style="flex:1">
-                                        <option value="">-- Choose a saved preset --</option>
-                                    </select>
-                                    <button id="load-template-btn" class="btn-ghost small"
-                                        title="Apply selected preset to the form">Apply</button>
-                                    <button id="export-template-btn" class="btn-ghost small"
-                                        title="Download selected preset as JSON">📥 Export</button>
-                                </div>
-                                <div class="template-save-row">
-                                    <input type="text" id="new-template-name" class="text-input"
-                                        placeholder="Preset name (e.g. Docking Prep)">
-                                    <button id="save-template-btn" class="btn-ghost small" title="Save current settings">💾 Save</button>
-                                    <button id="import-template-btn" class="btn-ghost small" title="Upload a preset JSON file">📤 Import</button>
-                                    <input type="file" id="import-template-input" accept=".json" class="hidden">
-                                </div>
-                            </div>
-
-
-                            <div class="button-row">
-                                <button id="process-btn" class="btn-primary">
-                                    <span id="process-btn-text">Process Structure</span>
-                                    <div class="spinner hidden" id="process-spinner"></div>
-                                </button>
-                            </div>
-
-                            <div id="precision-status" class="status-msg hidden"></div>
-                        </div>
-                    </aside>
-                </div>
-
-                <!-- ── BATCH TAB ───────────────────────────────────────── -->
-                <div class="tab-content hidden" id="tab-panel-batch">
-                    <aside class="controls-panel glass-panel">
-                        <div class="section-header">
-                            <h2>📦 Batch Processing</h2>
-                            <p class="muted">Upload multiple PDB files and apply the same settings to all.</p>
-                        </div>
-
-                        <div class="upload-zone" id="drop-zone-batch">
-                            <svg class="upload-icon" width="40" height="40" viewBox="0 0 24 24" fill="none"
-                                stroke="currentColor" stroke-width="1.5">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                <polyline points="17 8 12 3 7 8" />
-                                <line x1="12" y1="3" x2="12" y2="15" />
-                            </svg>
-                            <h3>Drop multiple .pdb files here</h3>
-                            <p>or click to browse</p>
-                            <input type="file" id="file-input-batch" accept=".pdb" multiple hidden>
-                        </div>
-                        <div id="batch-file-list" class="file-list"></div>
-
-                        <div class="batch-settings-grid">
-                            <div class="form-group">
-                                <label>Remove Waters</label>
-                                <div class="toggle-row"><input type="checkbox" id="b-remove-waters" checked><label
-                                        for="b-remove-waters">Yes</label></div>
-                            </div>
-                            <div class="form-group">
-                                <label>Remove Heteroatoms</label>
-                                <div class="toggle-row"><input type="checkbox" id="b-remove-hets" checked><label
-                                        for="b-remove-hets">Yes (all)</label></div>
-                            </div>
-                            <div class="form-group">
-                                <label>Target pH</label>
-                                <div class="slider-row">
-                                    <input type="range" id="b-ph-slider" min="1.0" max="14.0" step="0.1" value="7.4">
-                                    <span id="b-ph-val" class="ph-badge">7.4</span>
-                                </div>
-                            </div>
-                             <div class="form-group">
-                                <label>Energy Minimization</label>
-                                <div class="toggle-row"><input type="checkbox" id="b-run-mini"><label
-                                        for="b-run-mini">Enable</label></div>
-                                <div class="toggle-row sub-toggle" id="b-gbsa-row" style="display:none;">
-                                    <input type="checkbox" id="b-use-gbsa" checked>
-                                    <label for="b-use-gbsa">Use GBSA Solvent</label>
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label>Reconstruct Loops</label>
-                                <div class="toggle-row"><input type="checkbox" id="b-reconstruct"><label
-                                        for="b-reconstruct">Enable</label></div>
-                            </div>
-                            <div class="form-group">
-                                <label>Add Missing Atoms</label>
-                                <div class="toggle-row"><input type="checkbox" id="b-add-atoms"><label
-                                        for="b-add-atoms">Enable</label></div>
-                            </div>
-                            <div class="form-group">
-                                <label>Docking Target</label>
-                                <select id="b-docking" class="styled-select">
-                                    <option value="">None</option>
-                                    <option value="autodock">AutoDock</option>
-                                    <option value="vina">AutoDock Vina</option>
-                                    <option value="gromacs">GROMACS</option>
-                                </select>
-                            </div>
-                        </div>
-
-                        <div class="button-row">
-                            <button id="batch-process-btn" class="btn-primary">
-                                <span id="batch-btn-text">Process All Files</span>
-                                <div class="spinner hidden" id="batch-spinner"></div>
-                            </button>
-                        </div>
-
-                        <div id="batch-progress-wrapper" class="progress-wrapper hidden">
-                            <div class="progress-bar-track">
-                                <div id="batch-progress-bar" class="progress-bar-fill" style="width:0%"></div>
-                            </div>
-                            <div class="progress-label">
-                                <span id="batch-progress-label">0 / 0 processed</span>
-                            </div>
-                        </div>
-
-                        <div id="batch-status" class="status-msg hidden"></div>
-                    </aside>
-                </div>
-
-                <!-- ── HIGH-THROUGHPUT TAB ─────────────────────────────── -->
-                <div class="tab-content hidden" id="tab-panel-highthroughput">
-                    <aside class="controls-panel glass-panel">
-                        <div class="section-header">
-                            <h2>🚀 High-Throughput Pipeline</h2>
-                            <p class="muted">Bulk preparation from a ZIP file.</p>
-                        </div>
-
-                        <div class="upload-zone" id="drop-zone-ht">
-                            <svg class="upload-icon" width="40" height="40" viewBox="0 0 24 24" fill="none"
-                                stroke="currentColor" stroke-width="1.5">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                <polyline points="17 8 12 3 7 8" />
-                                <line x1="12" y1="3" x2="12" y2="15" />
-                            </svg>
-                            <h3>Drop a .zip file here</h3>
-                            <input type="file" id="file-input-ht" accept=".zip" hidden>
-                            <div id="ht-file-tag" class="file-tag hidden"></div>
-                        </div>
-
-                        <div class="batch-settings-grid">
-                            <div class="form-group">
-                                <label>Remove Waters</label>
-                                <div class="toggle-row"><input type="checkbox" id="ht-remove-waters" checked><label
-                                        for="ht-remove-waters">Yes</label></div>
-                            </div>
-                            <div class="form-group">
-                                <label>Remove Heteroatoms</label>
-                                <div class="toggle-row"><input type="checkbox" id="ht-remove-hets" checked><label
-                                        for="ht-remove-hets">Yes (all)</label></div>
-                            </div>
-                            <div class="form-group">
-                                <label>Target pH</label>
-                                <div class="slider-row">
-                                    <input type="range" id="ht-ph-slider" min="1.0" max="14.0" step="0.1" value="7.4">
-                                    <span id="ht-ph-val" class="ph-badge">7.4</span>
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label>Energy Minimization</label>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="ht-run-mini">
-                                    <label for="ht-run-mini">Enable</label>
-                                </div>
-                                <div class="toggle-row sub-toggle" id="ht-gbsa-row" style="display:none;">
-                                    <input type="checkbox" id="ht-use-gbsa" checked>
-                                    <label for="ht-use-gbsa">Use GBSA Solvent</label>
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label>Reconstruct Loops</label>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="ht-reconstruct">
-                                    <label for="ht-reconstruct">Enable</label>
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label>Add Missing Atoms</label>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="ht-add-atoms">
-                                    <label for="ht-add-atoms">Enable</label>
-                                </div>
-                            </div>
-                            <div class="form-group">
-                                <label>Docking Target</label>
-                                <select id="ht-docking" class="styled-select">
-                                    <option value="">None</option>
-                                    <option value="autodock">AutoDock</option>
-                                    <option value="vina">AutoDock Vina</option>
-                                    <option value="gromacs">GROMACS</option>
-                                </select>
-                            </div>
-                        </div>
-
-                        <div class="button-row">
-                            <button id="ht-process-btn" class="btn-primary">
-                                <span id="ht-btn-text">Start Pipeline</span>
-                                <div class="spinner hidden" id="ht-spinner"></div>
-                            </button>
-                        </div>
-
-                        <div id="ht-progress-wrapper" class="progress-wrapper hidden">
-                            <div class="progress-bar-track">
-                                <div id="ht-progress-bar" class="progress-bar-fill"
-                                    style="width: 50%; animation: pulse-bar 2s infinite;"></div>
-                            </div>
-                            <div class="progress-label">
-                                <span id="ht-progress-label">Processing... please wait</span>
-                            </div>
-                        </div>
-
-                        <div id="ht-status" class="status-msg hidden"></div>
-                    </aside>
-                </div>
-
-                <!-- ── SITE ANALYZER TAB ────────────────────────────────── -->
-                <div class="tab-content hidden" id="tab-panel-site">
-                    <aside class="controls-panel glass-panel">
-                        <div class="section-header">
-                            <h2>🧬 Binding Site Analyzer</h2>
-                            <p class="muted">Advanced pocket detection and pharmacophore analysis.</p>
-                        </div>
-
-                        <div class="info-banner">
-                            <p>Detect binding pockets and predict interaction features. You can upload a structure below for discovery.</p>
-                        </div>
-
-                        <div class="upload-zone small" id="drop-zone-site-manual" style="padding: 1.5rem; margin-top: 1.5rem;">
-                            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                <polyline points="17 8 12 3 7 8" />
-                                <line x1="12" y1="3" x2="12" y2="15" />
-                            </svg>
-                            <p style="font-size: 0.8rem;">Drop PDB here or click to browse</p>
-                            <input type="file" id="file-input-site-manual" accept=".pdb" hidden>
-                            <div id="site-file-name" class="file-tag hidden"></div>
-                        </div>
-
-                        <div class="button-row" style="margin-top: 1.5rem;">
-                            <button id="analyze-site-btn" class="btn-primary" onclick="runSiteAnalysis()">
-                                <span>Run Binding Site Discovery</span>
-                                <div class="spinner hidden" id="site-spinner"></div>
-                            </button>
-                        </div>
-
-                        <div id="site-status" class="status-msg hidden"></div>
-
-                        <div id="site-layers-panel" class="hidden" style="margin-top: 2rem; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 1.5rem;">
-                            <h3>Visibility Layers</h3>
-                            <div class="toggle-grid">
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="show-site-spheres" checked onchange="updateSiteViz()"><label for="show-site-spheres">Pocket Centroids</label>
-                                </div>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="show-site-acc" checked onchange="updateSiteViz()"><label for="show-site-acc">Acceptors (Red)</label>
-                                </div>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="show-site-don" checked onchange="updateSiteViz()"><label for="show-site-don">Donors (Blue)</label>
-                                </div>
-                                <div class="toggle-row">
-                                    <input type="checkbox" id="show-site-hphob" checked onchange="updateSiteViz()"><label for="show-site-hphob">Hydrophobic (Yellow)</label>
-                                </div>
-                            </div>
-                        </div>
-                    </aside>
-                </div>
-
-                <!-- ── HISTORY TAB ─────────────────────────────────────── -->
-
-                <div class="tab-content hidden" id="tab-panel-history">
-                    <div class="history-container glass-panel">
-                        <div class="section-header">
-                            <h2>📜 Past Processed Jobs</h2>
-                            <button id="refresh-history-btn" class="btn-ghost small">🔄 Refresh</button>
-                        </div>
-                        <p class="field-hint" style="margin-bottom: 1.5rem;">Your last 50 preparation jobs. Data is stored locally on this machine.</p>
-
-                        <!-- Status message for history-specific errors (e.g., expired session) -->
-                        <div id="history-status-msg" class="status-msg status-error hidden" style="margin-bottom: 1rem;"></div>
-
-                        <div id="history-list" class="history-grid">
-                            <!-- Job cards injected here -->
-                            <div class="empty-state">
-                                <p>No previous jobs found. Start processing proteins to build your history!</p>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-
-            <!-- ── RIGHT STACK (Shared Viewer & Reports) ────────────── -->
-            <div class="right-stack">
-                <div class="viewer-panel glass-panel">
-                    <div class="viewer-header">
-                        <h2>Structure Viewer</h2>
-                        <div class="viewer-toolbar">
-                            <span id="atom-count-badge" class="badge hidden"></span>
-                            <span id="state-badge" class="badge badge-info hidden"></span>
-                            <button id="reset-viewer-btn" class="btn-ghost small" title="Reset Viewer and Re-center">🔄 Reset</button>
-                            <button id="diff-mode-btn" class="btn-ghost small hidden" title="Toggle Visual Diff">⚖️
-                                Diff Mode</button>
-                        </div>
-                    </div>
-                    <div id="3dmol-viewer" class="mol-viewer">
-                        <div class="viewer-placeholder" id="viewer-placeholder">
-                            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                                stroke-width="1.5">
-                                <polygon points="12 2 2 7 12 12 22 7 12 2" />
-                                <polyline points="2 17 12 22 22 17" />
-                                <polyline points="2 12 12 17 22 12" />
-                            </svg>
-                            <p>Upload a structure to visualize</p>
-                        </div>
-                    </div>
-                </div>
-
-
-                <!-- Precision Report -->
-                <div id="report-panel" class="glass-panel report-panel hidden">
-                    <div class="report-header">
-                        <h2>📋 Preparation Report</h2>
-                        <div class="report-actions">
-                            <button id="copy-report-btn" class="btn-ghost small">📋 Copy</button>
-                            <button id="download-report-btn" class="btn-ghost small">⬇ Report</button>
-                            <button id="download-pdb-btn" class="btn-secondary small">⬇ PDB</button>
-                        </div>
-                    </div>
-                    <div id="report-grid" class="report-grid"></div>
-                    <div id="repro-panel" class="repro-settings">
-                        <h3>🔁 Reproducibility Settings</h3>
-                        <div id="repro-grid" class="repro-grid"></div>
-                    </div>
-                    <div id="mini-report-panel" class="mini-report hidden">
-                        <h3>⚡ Energy Minimization</h3>
-                        <div id="mini-grid" class="report-grid"></div>
-                    </div>
-                    <div id="warnings-panel" class="mini-report hidden">
-                        <h3>⚠️ Warnings</h3>
-                        <ul id="warnings-list" class="warnings-list"></ul>
-                    </div>
-                </div>
-
-                <!-- Batch Results -->
-                <div id="batch-results" class="glass-panel report-panel hidden">
-                    <div class="report-header">
-                        <h2>✅ Batch Complete</h2>
-                        <div class="report-actions">
-                            <button id="preview-batch-btn" class="btn-ghost small">👁 Preview Results</button>
-                            <button id="download-batch-btn" class="btn-secondary small">⬇ Download ZIP</button>
-                        </div>
-                    </div>
-                    <div id="batch-summary" class="report-grid"></div>
-                </div>
-
-                <!-- HT Results -->
-                <div id="ht-results" class="glass-panel report-panel hidden">
-                    <div class="report-header">
-                        <h2>✅ Pipeline Complete</h2>
-                        <div class="report-actions">
-                            <button id="preview-ht-btn" class="btn-ghost small">👁 Preview Results</button>
-                            <button id="download-ht-btn" class="btn-secondary small">⬇ Download ZIP</button>
-                        </div>
-                    </div>
-                    <div id="ht-log-panel" class="log-panel">
-                        <h3>📜 Processing Logs</h3>
-                        <pre id="ht-log-output" class="log-output"></pre>
-                    </div>
-                </div>
-
-                <!-- Site Results -->
-                <div id="site-results" class="glass-panel report-panel hidden">
-                    <div class="report-header">
-                        <h2>🧬 Discovered Binding Sites</h2>
-                        <div class="report-actions">
-                            <button id="clear-sites-btn" class="btn-ghost small" onclick="clearSiteViz()">✕ Clear</button>
-                        </div>
-                    </div>
-                    <div id="site-list" class="site-scroll-list">
-                        <!-- Site cards injected here -->
-                    </div>
-
-                    <!-- Selected site details -->
-                    <div id="active-site-info" class="mt-sm"></div>
-
-                    <div id="site-summary-panel" class="hidden" style="margin-top: 1.5rem; border-top: 1px solid var(--glass-b); padding-top: 1rem;">
-                        <h3>📊 Analysis Summary</h3>
-                        <div id="site-summary-text" style="font-size: 0.9rem; line-height: 1.5; color: var(--text);"></div>
-                        <div id="site-summary-stats" class="report-grid" style="margin-top: 1rem;"></div>
-                    </div>
-                </div>
-
-            </div>
-        </main>
-
-
-    </div><!-- /app-shell -->
-
-
-
-    <!-- ── VIEWER MODAL ──────────────────────────────────────── -->
-    <div id="viewer-modal" class="modal-overlay hidden">
-        <div class="modal-box glass-panel viewer-modal-box">
-            <div class="modal-header">
-                <h3 id="modal-viewer-title">3D Structure Preview</h3>
-                <button id="close-viewer-btn" class="btn-ghost small">✕</button>
-            </div>
-
-            <div class="modal-viewer-flex">
-                <div id="modal-3d-viewer" class="modal-mol-viewer"></div>
-
-                <div id="modal-file-sidebar" class="modal-sidebar hidden">
-                    <h4>Select File</h4>
-                    <div id="modal-file-list" class="modal-file-list"></div>
-                </div>
-            </div>
-        </div>
+  <!-- ══════════════════════════════════════════════════ SIDEBAR ══ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+        <path d="M4 4c3 0 3 4 6 4s3-4 6-4 3 4 6 4"/>
+        <path d="M4 12c3 0 3 4 6 4s3-4 6-4 3 4 6 4"/>
+        <path d="M4 20c3 0 3-4 6-4s3 4 6 4 3-4 6-4" opacity="0.35"/>
+      </svg>
+      <div>
+        <div class="brand-name">BioPrep</div>
+        <div class="brand-sub">Structure preparation</div>
+      </div>
     </div>
 
-    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
-</body>
+    <nav class="nav" id="nav">
+      <button class="nav-item active" data-view="prepare"><span class="nav-dot"></span>Prepare</button>
+      <button class="nav-item" data-view="sites"><span class="nav-dot"></span>Binding sites</button>
+      <button class="nav-item" data-view="batch"><span class="nav-dot"></span>Batch</button>
+      <button class="nav-item" data-view="throughput"><span class="nav-dot"></span>High-throughput</button>
+      <button class="nav-item" data-view="history"><span class="nav-dot"></span>History</button>
+      <button class="nav-item" data-view="templates"><span class="nav-dot"></span>Templates</button>
+    </nav>
 
+    <div class="nav-footer">
+      Structures are processed locally.<br>Nothing leaves this machine.
+    </div>
+  </aside>
+
+  <!-- ══════════════════════════════════════════════════ MAIN ══════ -->
+  <main class="main">
+
+    <!-- ─────────────────────────────────────────── PREPARE ─────── -->
+    <section class="view active" id="view-prepare">
+      <div class="view-header">
+        <h1 class="view-title">Prepare a structure</h1>
+        <p class="view-desc">Clean, protonate, minimise and export a single PDB or mmCIF file.</p>
+      </div>
+
+      <div id="prepare-upload">
+        <div class="dropzone" id="prepare-dropzone">
+          <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v12m0-12 4 4m-4-4-4 4"/>
+            <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+          </svg>
+          <div class="dropzone-title">Drop a structure file, or click to browse</div>
+          <div class="dropzone-hint">.pdb, .ent, .cif, .mmcif</div>
+          <input type="file" id="prepare-file-input" accept=".pdb,.ent,.cif,.mmcif">
+        </div>
+      </div>
+
+      <div class="stack hidden" id="prepare-workspace">
+
+        <div class="row-between">
+          <div class="row">
+            <span class="file-chip" id="prepare-file-chip"></span>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="prepare-reset-btn">Start over</button>
+        </div>
+
+        <div class="grid-2">
+          <!-- left column: configuration -->
+          <div class="stack">
+
+            <div class="panel" id="prepare-structure-panel">
+              <div class="panel-title">Structure</div>
+              <div class="stack" style="gap: var(--space-3)">
+                <div>
+                  <div class="eyebrow">Chains</div>
+                  <div class="pill-group" id="chain-pills"></div>
+                </div>
+                <div>
+                  <div class="eyebrow">Heteroatoms detected</div>
+                  <div class="pill-group" id="hetero-pills"></div>
+                  <p class="dropzone-hint" style="margin-top:6px">Click once to remove, twice to protect. Unlisted ligands are always kept.</p>
+                </div>
+                <div id="gap-callout"></div>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-title">Protonation</div>
+              <div class="stack" style="gap: var(--space-3)">
+                <label class="field">
+                  <span class="field-label">pH — <span class="value-mono" id="ph-readout">7.4</span></span>
+                  <input type="range" id="ph-slider" min="0" max="14" step="0.1" value="7.4">
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" id="opt-remove-water" checked>
+                  <span><span class="check-text">Remove water</span></span>
+                </label>
+                <label class="check-row" id="opt-structural-water-row">
+                  <input type="checkbox" id="opt-structural-water">
+                  <span>
+                    <span class="check-text">Keep structural waters</span>
+                    <div class="check-desc">Waters within 3.5 Å of a hydrogen-bonding atom</div>
+                  </span>
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" id="opt-reconstruct-loops">
+                  <span>
+                    <span class="check-text">Reconstruct missing loops</span>
+                    <div class="check-desc">Rebuild residues present in SEQRES but absent from coordinates</div>
+                  </span>
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" id="opt-missing-atoms">
+                  <span>
+                    <span class="check-text">Add missing heavy atoms</span>
+                    <div class="check-desc">Rebuild incomplete side chains</div>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-title">Energy minimisation</div>
+              <label class="check-row">
+                <input type="checkbox" id="opt-minimize">
+                <span class="check-text">Run energy minimisation</span>
+              </label>
+              <div class="stack hidden" id="minimize-options" style="gap: var(--space-3); margin-top: var(--space-3)">
+                <label class="field">
+                  <span class="field-label">Force field</span>
+                  <select id="opt-force-field">
+                    <option value="amber14">AMBER14</option>
+                    <option value="charmm36">CHARMM36</option>
+                  </select>
+                </label>
+                <label class="check-row">
+                  <input type="checkbox" id="opt-gbsa" checked>
+                  <span>
+                    <span class="check-text">GBSA implicit solvent</span>
+                    <div class="check-desc">OBC2 generalised Born model</div>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="panel-title">Export</div>
+              <label class="field">
+                <span class="field-label">Docking target <span class="optional">(optional)</span></span>
+                <select id="opt-docking-target">
+                  <option value="">Standard PDB</option>
+                  <option value="vina">AutoDock Vina (PDBQT)</option>
+                  <option value="autodock">AutoDock (PDBQT)</option>
+                  <option value="gromacs">GROMACS</option>
+                </select>
+              </label>
+            </div>
+
+            <button class="btn btn-primary btn-block" id="process-btn">
+              <span id="process-btn-label">Process structure</span>
+            </button>
+          </div>
+
+          <!-- right column: analysis + viewer -->
+          <div class="stack">
+            <div class="panel">
+              <div class="panel-title">Structure summary</div>
+              <div class="kv-list" id="analysis-summary"></div>
+            </div>
+
+            <div class="viewer-shell">
+              <div class="viewer-canvas" id="prepare-viewer"></div>
+              <div class="viewer-toolbar hidden" id="prepare-viewer-toolbar">
+                <span id="viewer-label">Original</span>
+                <div class="row" style="gap:6px">
+                  <button class="btn btn-ghost btn-sm" id="viewer-toggle-btn">Show prepared</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- report, appears after processing -->
+        <div class="stack hidden" id="report-section">
+          <hr class="rule">
+          <div class="row-between">
+            <h2 style="font-size:15px">Preparation report</h2>
+            <div class="row" style="gap:6px">
+              <button class="btn btn-ghost btn-sm" id="report-copy-btn">Copy text</button>
+              <button class="btn btn-ghost btn-sm" id="report-download-btn">Download report</button>
+              <button class="btn btn-sm" id="download-pdb-btn">Download structure</button>
+              <button class="btn btn-sm" id="prepare-sites-btn">Analyse binding sites</button>
+            </div>
+          </div>
+
+          <div class="stat-grid" id="report-stats"></div>
+
+          <div id="report-warnings"></div>
+
+          <div class="grid-2">
+            <div class="panel">
+              <div class="panel-title">Protonation</div>
+              <div class="kv-list" id="report-protonation"></div>
+            </div>
+            <div class="panel hidden" id="report-minimization-panel">
+              <div class="panel-title">Energy minimisation</div>
+              <div class="kv-list" id="report-minimization"></div>
+            </div>
+          </div>
+
+          <details>
+            <summary class="btn-ghost btn-sm" style="display:inline-flex;cursor:pointer;border-radius:var(--radius);padding:6px 10px">Full text report</summary>
+            <div class="log-block" id="report-text-block" style="margin-top:8px"></div>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────── BINDING SITES ── -->
+    <section class="view" id="view-sites">
+      <div class="view-header">
+        <h1 class="view-title">Binding site analysis</h1>
+        <p class="view-desc">Grid-based pocket detection with druggability scoring.</p>
+      </div>
+
+      <div class="dropzone" id="sites-dropzone">
+        <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/>
+        </svg>
+        <div class="dropzone-title">Drop a prepared structure to analyse</div>
+        <div class="dropzone-hint">Heavy atoms only — hydrogens and waters are excluded from cavity detection</div>
+        <input type="file" id="sites-file-input" accept=".pdb,.ent,.cif,.mmcif">
+      </div>
+
+      <div class="stack hidden" id="sites-workspace">
+        <div class="row-between">
+          <span class="file-chip" id="sites-file-chip"></span>
+          <button class="btn btn-ghost btn-sm" id="sites-reset-btn">Start over</button>
+        </div>
+
+        <div class="grid-2">
+          <div class="panel">
+            <div class="panel-title">Detected pockets</div>
+            <div id="sites-list" class="stack" style="gap:10px"></div>
+          </div>
+          <div class="viewer-shell">
+            <div class="viewer-canvas" id="sites-viewer"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────── BATCH ────────── -->
+    <section class="view" id="view-batch">
+      <div class="view-header">
+        <h1 class="view-title">Batch processing</h1>
+        <p class="view-desc">Apply one set of options to several structures. Returns a zip with each result and a combined report.</p>
+      </div>
+
+      <div class="grid-2">
+        <div class="stack">
+          <div class="dropzone" id="batch-dropzone">
+            <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3v12m0-12 4 4m-4-4-4 4"/>
+              <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+            </svg>
+            <div class="dropzone-title">Drop multiple .pdb files</div>
+            <div class="dropzone-hint">Or click to browse</div>
+            <input type="file" id="batch-file-input" accept=".pdb" multiple>
+          </div>
+          <div id="batch-file-list" class="stack" style="gap:4px"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Settings</div>
+          <div id="batch-settings"></div>
+          <button class="btn btn-primary btn-block" id="batch-run-btn" style="margin-top:var(--space-4)" disabled>Run batch</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────── THROUGHPUT ───── -->
+    <section class="view" id="view-throughput">
+      <div class="view-header">
+        <h1 class="view-title">High-throughput pipeline</h1>
+        <p class="view-desc">Upload a zip archive of structures. Supports large collections.</p>
+      </div>
+
+      <div class="grid-2">
+        <div class="stack">
+          <div class="dropzone" id="ht-dropzone">
+            <svg class="dropzone-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="4" width="16" height="16" rx="1.5"/><path d="M4 9h16M9 4v16"/>
+            </svg>
+            <div class="dropzone-title">Drop a .zip archive</div>
+            <div class="dropzone-hint">Or click to browse</div>
+            <input type="file" id="ht-file-input" accept=".zip">
+          </div>
+          <span class="file-chip hidden" id="ht-file-chip"></span>
+        </div>
+
+        <div class="panel">
+          <div class="panel-title">Settings</div>
+          <div id="ht-settings"></div>
+          <button class="btn btn-primary btn-block" id="ht-run-btn" style="margin-top:var(--space-4)" disabled>Run pipeline</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────── HISTORY ──────── -->
+    <section class="view" id="view-history">
+      <div class="view-header">
+        <div class="row-between">
+          <div>
+            <h1 class="view-title">History</h1>
+            <p class="view-desc">The last 50 processed structures.</p>
+          </div>
+          <button class="btn btn-ghost btn-sm" id="history-refresh-btn">Refresh</button>
+        </div>
+      </div>
+      <div id="history-content"></div>
+    </section>
+
+    <!-- ─────────────────────────────────────────── TEMPLATES ────── -->
+    <section class="view" id="view-templates">
+      <div class="view-header">
+        <h1 class="view-title">Templates</h1>
+        <p class="view-desc">Saved parameter presets for the Prepare, Batch and High-throughput panels.</p>
+      </div>
+      <div id="templates-content"></div>
+    </section>
+
+  </main>
+</div>
+
+<div class="toast-stack" id="toast-stack"></div>
+<div id="modal-root"></div>
+
+<script src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
 </html>
