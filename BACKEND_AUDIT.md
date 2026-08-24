@@ -338,11 +338,23 @@ pocket-free, and hid every defect below.
 | `converged` measured the wrong thing | It reported the energy having fallen, so a 100-iteration run "converged" while 1000 iterations went 900 kJ/mol lower | Compares RMS force against the tolerance `minimizeEnergy` was given. 1CRN: 5 iters → 695, False; 100 → 15.4, False; 1000 → 5.05, True |
 | Bond constraints made convergence unmeasurable | `HBonds` put constraint forces into `getForces()`; RMS force never approached the tolerance | Minimisation is unconstrained — nothing here integrates dynamics. 1CRN: −5166.9 kJ/mol and RMS 5.76 versus −5162.7 and 71.16 |
 | Chain selection silently defeated ligand protection | Select's `accept_chain` is an all-or-nothing gate: rejecting a chain skips `accept_residue` for everything in it. A ligand routinely sits on a different chain than the receptor — HIV-1 protease's inhibitor MK1 is chain B of the A/B dimer — so `chains=['A']` dropped an explicitly protected ligand with no warning; the report just showed `ligands_preserved: []` | `accept_chain` now always accepts; the chain decision moved into `accept_residue`, checked *after* the protection override so a named ligand survives regardless of which chain it is recorded under. An unprotected heteroatom on an unselected chain is still dropped — confirmed by a dedicated test |
+| A chain end missing backbone atoms, not just its sidechain, crashed protonation outright | With `add_missing_atoms` off (the default), `fixer.missingAtoms` was cleared to `{}` entirely on the theory that everything in it is optional sidechain remodelling. It isn't: a residue with no resolved density past its amide N is missing CA/C/O too, and PDBFixer's own terminal-placement code reads `atomPositions['O']` and `['CA']` unconditionally when a `missingTerminals` entry exists for that residue — wiping the dict removed the record that those atoms needed adding, so `addMissingAtoms()` raised `KeyError: 'O'`. Hit 4 of 89 real structures pulled live from RCSB across an "industrial-scale" sweep (zinc fingers, protein–DNA/RNA complexes, heme/Fe–S/Cu proteins, glycoproteins, membrane proteins, NMR ensembles): `1PRC`, `1BGB`, `1K8W`, `2DRP` | Only sidechain atoms are dropped when the flag is off; backbone atoms (N/CA/C/O) are kept regardless, same reasoning as why `missingTerminals` itself is never cleared. All 4 process cleanly now; regression test reproduces it from a synthetic terminal residue rather than depending on any one PDB file |
 
 Found by `verification/stress_combinations.py`, which exercises several
 settings together on real complexes rather than one or two at a time — this
 particular interaction only shows up with chain selection and ligand
 protection combined, and every isolated test of either had passed.
+
+The backbone-atom finding above was found by a from-scratch sweep of 89 real
+structures fetched live from RCSB (`search.rcsb.org` for protein–DNA,
+protein–RNA and NMR-method structures; hand-picked PDB IDs for zinc fingers,
+heme/Fe–S/Cu proteins, glycoproteins, membrane proteins, and small-globular
+controls), run through the actual `/api/high-throughput` endpoint with
+default settings. 84/89 succeeded on the first pass; the other 5 were the 4
+`KeyError('O')` cases above plus one structure whose *download* had been
+truncated by a transient network issue during the fetch (not a bioprep bug —
+a fresh download of the same entry, PIT-1/DNA complex `1AU7`, processed
+correctly). A rerun after the fix: 89/89 succeeded.
 
 ### Verified correct
 

@@ -38,6 +38,15 @@ from openmm.app import PDBFile
 
 from .residues import is_standard, is_water
 
+# A residue can be missing more than its sidechain - real deposited structures
+# routinely have a chain terminus with no density past the amide nitrogen, so
+# CA/C/O are absent too. Those aren't a modelling choice the way a sidechain
+# is: without them PDBFixer has nothing to compute a terminal OXT position
+# from, and addMissingAtoms() raises KeyError trying to read them. So only
+# sidechain atoms get dropped when add_missing_atoms is off; backbone atoms
+# stay regardless, same reasoning as why missingTerminals is never cleared.
+BACKBONE_ATOM_NAMES = frozenset(('N', 'CA', 'C', 'O'))
+
 
 def _split_records(pdb_path):
     """
@@ -288,11 +297,19 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
         # structure falls through every minimisation tier - which is what
         # happens to any crystal structure deposited without a capped terminus.
         # Rebuilding absent side chains is a modelling choice and stays behind
-        # the flag, so when the flag is off the sidechain list is cleared and
-        # only the terminals are added.
+        # the flag, so when the flag is off, sidechain atoms are dropped from
+        # the list - but backbone atoms (N/CA/C/O) stay: a residue with no
+        # resolved density past its amide nitrogen is missing those too, and
+        # PDBFixer's own terminal-placement math needs CA and O to exist.
         terminal_atoms = sum(len(v) for v in fixer.missingTerminals.values())
         if not (add_missing_atoms or reconstruct_loops):
-            fixer.missingAtoms = {}
+            fixer.missingAtoms = {
+                residue: [atom for atom in atoms if atom.name in BACKBONE_ATOM_NAMES]
+                for residue, atoms in fixer.missingAtoms.items()
+            }
+            fixer.missingAtoms = {
+                residue: atoms for residue, atoms in fixer.missingAtoms.items() if atoms
+            }
 
         result['terminals_repaired'] = terminal_atoms
         if terminal_atoms:

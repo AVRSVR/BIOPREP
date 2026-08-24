@@ -872,6 +872,37 @@ class TestProtonator(TempDirTest):
                 bonded |= refs
         self.assertEqual(bonded, serials, 'ligand CONECT serials were not remapped')
 
+    def test_terminal_residue_missing_backbone_atoms_does_not_crash(self):
+        """A chain end missing more than its sidechain must still protonate.
+
+        Real deposited structures routinely have no resolved density past a
+        terminal residue's amide nitrogen - CA/C/O are absent, not just the
+        sidechain. With add_missing_atoms left at its default (False), the
+        code used to wipe fixer.missingAtoms entirely, which also discarded
+        those missing backbone atoms. PDBFixer's own terminal-placement code
+        then tried to read the (never-added) O and CA positions and raised
+        KeyError('O') - reproduced first against 1PRC, 1BGB, 1K8W and 2DRP
+        pulled live from RCSB. This is the minimal repro.
+        """
+        lines = _protein_lines()
+        last_resseq = lines[-1][22:26]
+        kept = [l for l in lines
+                if l[22:26] != last_resseq or l[12:16].strip() == 'N']
+        self.assertLess(len(kept), len(lines),
+                        'fixture did not actually drop any atoms')
+        source = _write(self.path('in.pdb'), kept)
+
+        result = protonator.add_hydrogens(source, self.path('out.pdb'), ph=7.4)
+
+        self.assertTrue(result['hydrogens_added'])
+        out_names = {
+            l[12:16].strip() for l in
+            pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+            if l.startswith('ATOM') and l[22:26] == last_resseq
+        }
+        self.assertTrue({'CA', 'C', 'O'} <= out_names,
+                        'missing backbone atoms were not rebuilt: got ' + repr(out_names))
+
 
 class TestProtonationFeatures(TempDirTest):
     """Features 12-22: pH, ligand separation, repairs, status report."""
