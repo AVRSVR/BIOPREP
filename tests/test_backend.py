@@ -1654,6 +1654,30 @@ class TestScienceCorrectness(TempDirTest):
     These ask whether the result is defensible, not whether the code ran.
     """
 
+    def test_no_forcefield_offers_a_tyrosinate_template(self):
+        """
+        Confirms the tyrosine-deprotonation limit by inspecting the actual
+        template inventory rather than assuming it. AMBER14 defines only TYR,
+        NTYR and CTYR - no anionic form, unlike HIS's HID/HIE/HIP or LYS's
+        LYS/LYN. CHARMM36's STYR looks like a candidate but has 16 atoms
+        against TYR's 21 and no OH or HH atom at all, so it is some other
+        truncated variant, not a tyrosinate. PDBFixer has nowhere to select a
+        deprotonated tyrosine from in either force field this tool offers.
+        """
+        from openmm.app import ForceField
+
+        amber = ForceField('amber14-all.xml')
+        amber_tyr = {t.name for t in amber._templates.values() if 'TYR' in t.name}
+        self.assertEqual(amber_tyr, {'TYR', 'NTYR', 'CTYR'})
+
+        charmm = ForceField('charmm36.xml')
+        charmm_templates = {t.name: t for t in charmm._templates.values()}
+        self.assertIn('STYR', charmm_templates)
+        styr_atoms = {a.name for a in charmm_templates['STYR'].atoms}
+        self.assertFalse(styr_atoms & {'OH', 'HH'},
+                         'STYR unexpectedly carries a hydroxyl - it may now '
+                         'be a real tyrosinate; revisit the documented limit')
+
     def test_disulfide_cysteines_are_not_protonated(self):
         """
         1CRN has three disulfide bridges. A bridged cysteine is oxidised;
