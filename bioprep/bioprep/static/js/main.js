@@ -119,7 +119,32 @@
     }
     // Match the surrounding panel rather than forcing a white box that
     // breaks dark mode.
-    return $3Dmol.createViewer(containerEl, { backgroundColor: cssVar("--paper-sunken") || "white" });
+    let viewer;
+    try {
+      viewer = $3Dmol.createViewer(containerEl, { backgroundColor: cssVar("--paper-sunken") || "white" });
+    } catch (_) {
+      viewer = null;
+    }
+    if (!viewer) {
+      // Most often a browser-wide WebGL context limit - every tab shares one
+      // budget, and each history report opened its own context that a plain
+      // DOM removal doesn't free. Say so instead of leaving a blank box.
+      containerEl.parentElement.innerHTML =
+        '<div class="viewer-empty"><span>3D viewer unavailable — too many structure viewers are open. Close some report tabs/windows and reload.</span></div>';
+    }
+    return viewer;
+  }
+
+  // A closed history-report modal removes the canvas from the DOM, but the
+  // WebGL context behind it is only freed by the browser's own garbage
+  // collector - not guaranteed to run before the next modal wants a new one.
+  // Explicitly losing it here is what actually frees the slot immediately.
+  function disposeViewerContext(containerEl) {
+    const canvas = containerEl && containerEl.querySelector("canvas");
+    if (!canvas) return;
+    const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+    const ext = gl && gl.getExtension("WEBGL_lose_context");
+    if (ext) ext.loseContext();
   }
 
   function renderStructure(viewer, pdbText, style = "cartoon") {
@@ -138,6 +163,16 @@
 
   // Ambient structure shown before any file is uploaded, so the tool reads
   // as a protein viewer from the first paint rather than a bare dropzone.
+  // Its spin keeps rendering even once the dropzone is hidden behind the
+  // workspace view - CSS visibility doesn't stop a WebGL render loop - so
+  // stopHeroSpin() below is called the moment a real upload takes over, to
+  // stop burning GPU time on a viewer nobody can see any more.
+  let heroViewer = null;
+
+  function stopHeroSpin() {
+    if (heroViewer) heroViewer.spin(false);
+  }
+
   async function initHeroViewer() {
     const el = qs("#hero-viewer");
     if (!el) return;
@@ -147,6 +182,7 @@
       const pdbText = await (await fetch("/static/data/hero_structure.pdb")).text();
       renderStructure(viewer, pdbText, "cartoon");
       viewer.spin("y", 0.4);
+      heroViewer = viewer;
     } catch (_) { /* decorative only */ }
   }
 
@@ -248,6 +284,7 @@
       qs("#prepare-workspace").classList.add("hidden");
       qs("#report-section").classList.add("hidden");
       qs("#prepare-file-input").value = "";
+      if (heroViewer) heroViewer.spin("y", 0.4);
     }
 
     async function onFileChosen(file) {
@@ -256,6 +293,7 @@
         `${escapeHtml(file.name)} <button id="prepare-file-clear" title="Remove">${ICON.x}</button>`;
       qs("#prepare-upload").classList.add("hidden");
       qs("#prepare-workspace").classList.remove("hidden");
+      stopHeroSpin();
       qs("#report-section").classList.add("hidden");
       qs("#prepare-file-clear").addEventListener("click", reset);
 
@@ -350,14 +388,22 @@
       try {
         const res = await api(`/api/history/pdb/${sessionId}`);
         originalPdbText = await res.text();
-        if (!viewer) viewer = createViewer(qs("#prepare-viewer"));
-        if (viewer) {
-          renderStructure(viewer, originalPdbText);
-          qs("#prepare-viewer-toolbar").classList.remove("hidden");
-          qs("#viewer-label").textContent = "Original";
-          viewerMode = "original";
-        }
-      } catch (_) { /* viewer is a convenience, not required */ }
+      } catch (err) {
+        // Fetching the structure back failed - nothing to render, but say so
+        // rather than leaving a viewer that looks broken with no explanation.
+        toast(`Couldn't load the structure into the viewer: ${err.message}`, "rust");
+        return;
+      }
+      if (!viewer) viewer = createViewer(qs("#prepare-viewer"));
+      if (!viewer) return; // createViewer already reported why
+      try {
+        renderStructure(viewer, originalPdbText);
+        qs("#prepare-viewer-toolbar").classList.remove("hidden");
+        qs("#viewer-label").textContent = "Original";
+        viewerMode = "original";
+      } catch (err) {
+        toast(`Couldn't render this structure: ${err.message}`, "rust");
+      }
     }
 
     function gatherSettings() {
@@ -520,11 +566,17 @@
 
       qs("#report-text-block").textContent = data.report_text || "";
 
-      // viewer: switch to prepared
+      // viewer: switch to prepared. Isolated in its own try/catch - a
+      // rendering failure here is not a reason to also lose the download
+      // and copy buttons wired below.
       if (viewer) {
-        renderStructure(viewer, preparedPdbText);
-        qs("#viewer-label").textContent = "Prepared";
-        viewerMode = "prepared";
+        try {
+          renderStructure(viewer, preparedPdbText);
+          qs("#viewer-label").textContent = "Prepared";
+          viewerMode = "prepared";
+        } catch (err) {
+          toast(`Couldn't render the prepared structure: ${err.message}`, "rust");
+        }
       }
 
       // downloads
@@ -867,8 +919,12 @@
         </div>
       </div>`;
     root.appendChild(backdrop);
-    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) backdrop.remove(); });
-    qs("#modal-close", backdrop).addEventListener("click", () => backdrop.remove());
+    const closeModal = () => {
+      disposeViewerContext(qs("#modal-viewer", backdrop));
+      backdrop.remove();
+    };
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) closeModal(); });
+    qs("#modal-close", backdrop).addEventListener("click", closeModal);
 
     api(`/api/history/pdb/${job.id}`).then((r) => r.text()).then((text) => {
       const v = createViewer(qs("#modal-viewer", backdrop));
