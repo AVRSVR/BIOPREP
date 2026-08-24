@@ -145,11 +145,7 @@
     if (!viewer) return;
     try {
       const pdbText = await (await fetch("/static/data/hero_structure.pdb")).text();
-      viewer.addModel(pdbText, "pdb");
-      viewer.setStyle({}, { cartoon: { color: cssVar("--accent") || "teal" } });
-      viewer.setStyle({ hetflag: true }, { stick: { color: cssVar("--rust") || "firebrick", radius: 0.22 } });
-      viewer.zoomTo();
-      viewer.render();
+      renderStructure(viewer, pdbText, "cartoon");
       viewer.spin("y", 0.4);
     } catch (_) { /* decorative only */ }
   }

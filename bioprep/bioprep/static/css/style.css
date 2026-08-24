@@ -546,9 +546,10 @@ table.data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   border-radius: var(--radius-lg);
   overflow: hidden;
   background: var(--paper-sunken);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.10);
 }
 .hero-shell { margin-bottom: var(--space-4); }
-.viewer-canvas { width: 100%; height: 360px; position: relative; }
+.viewer-canvas { width: 100%; height: 520px; position: relative; }
 .viewer-toolbar {
   display: flex;
   align-items: center;
@@ -560,7 +561,7 @@ table.data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   color: var(--ink-soft);
 }
 .viewer-empty {
-  height: 360px;
+  height: 520px;
   display: flex;
   align-items: center;
   justify-content: center;
