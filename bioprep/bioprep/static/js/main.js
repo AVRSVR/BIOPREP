@@ -107,13 +107,19 @@
 
   // ── 3Dmol wrapper (defensive: CDN may be unavailable) ────────────────
 
+  function cssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+
   function createViewer(containerEl) {
     if (typeof $3Dmol === "undefined") {
       containerEl.parentElement.innerHTML =
         '<div class="viewer-empty"><span>3D viewer script did not load</span></div>';
       return null;
     }
-    return $3Dmol.createViewer(containerEl, { backgroundColor: "white" });
+    // Match the surrounding panel rather than forcing a white box that
+    // breaks dark mode.
+    return $3Dmol.createViewer(containerEl, { backgroundColor: cssVar("--paper-sunken") || "white" });
   }
 
   function renderStructure(viewer, pdbText, style = "cartoon") {
@@ -128,6 +134,24 @@
     }
     viewer.zoomTo();
     viewer.render();
+  }
+
+  // Ambient structure shown before any file is uploaded, so the tool reads
+  // as a protein viewer from the first paint rather than a bare dropzone.
+  async function initHeroViewer() {
+    const el = qs("#hero-viewer");
+    if (!el) return;
+    const viewer = createViewer(el);
+    if (!viewer) return;
+    try {
+      const pdbText = await (await fetch("/static/data/hero_structure.pdb")).text();
+      viewer.addModel(pdbText, "pdb");
+      viewer.setStyle({}, { cartoon: { color: cssVar("--accent") || "teal" } });
+      viewer.setStyle({ hetflag: true }, { stick: { color: cssVar("--rust") || "firebrick", radius: 0.22 } });
+      viewer.zoomTo();
+      viewer.render();
+      viewer.spin("y", 0.4);
+    } catch (_) { /* decorative only */ }
   }
 
   // ── shared settings panel (used by Batch and High-throughput) ───────
@@ -949,5 +973,6 @@
     Sites.init();
     Batch.init();
     Throughput.init();
+    initHeroViewer();
   });
 })();
