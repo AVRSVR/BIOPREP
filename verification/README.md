@@ -16,6 +16,19 @@ python verification/run_all.py features    # catalogue features 1-121
 python verification/run_all.py science     # physics and chemistry only
 ```
 
+Running an individual script standalone (rather than through `run_all.py`,
+which already passes `-u`) or in the background, use `python -u`:
+
+```bash
+python -u verification/science_02.py > run.log 2>&1 &
+```
+
+Python block-buffers stdout when it is not a terminal. If the process is
+killed externally - a timeout, closing the session it was backgrounded
+in - before it exits normally, that buffer is never flushed and every
+`print()` is lost; only unbuffered logger output survives. `-u` writes each
+line as it is produced, so a killed run still leaves a usable partial log.
+
 ## Feature scripts
 
 | Script | Features | Module |

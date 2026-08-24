@@ -46,7 +46,11 @@ SUMMARY = re.compile(r"(\d+) checks across (features [\d\-]+), (\d+) failed")
 def run(script):
     path = os.path.join(HERE, script)
     started = time.time()
-    proc = subprocess.run([PYTHON, path], capture_output=True, text=True)
+    # -u: unbuffered stdout. If a run is killed externally (a timeout, a
+    # session teardown) before it exits normally, Python never flushes a
+    # block-buffered stream, so everything but unbuffered logger output is
+    # lost. Unbuffered mode means each line is on disk as it is printed.
+    proc = subprocess.run([PYTHON, "-u", path], capture_output=True, text=True)
     elapsed = time.time() - started
 
     output = proc.stdout
