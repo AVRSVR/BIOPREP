@@ -356,6 +356,15 @@ truncated by a transient network issue during the fetch (not a bioprep bug —
 a fresh download of the same entry, PIT-1/DNA complex `1AU7`, processed
 correctly). A rerun after the fix: 89/89 succeeded.
 
+| An mmCIF upload never rendered in the Prepare viewer | `/api/process` converts mmCIF to PDB via `ensure_pdb()` before anything else, but `/api/analyze` — the route the viewer's pre-processing preview actually calls — stored the raw uploaded bytes as-is, under a filename ending `.pdb` regardless of the real format. `/api/history/pdb/<session_id>` serves that stored file straight to 3Dmol as format `"pdb"`; handed genuine mmCIF text (`data_3OIE`... instead of `ATOM`/`HEADER` records), 3Dmol found nothing it recognised and rendered an empty canvas — no exception, no console error, nothing for a user to go on. Reported live: uploading `3OIE.cif` (a protein–DNA complex) left the viewer panel blank | `/api/analyze` now runs the same `ensure_pdb()` conversion `/api/process` already did before storing the session. Also hardened the same class of failure on the client: `loadOriginalIntoViewer()` had a bare `catch (_) {}` around the fetch *and* the render call, so any failure there — this one included — surfaced as nothing rather than an error. Both the fetch and the render now report a toast on failure instead of failing silently, and the equivalent direct-upload path in Binding Sites (which reads the file client-side and has no server round trip to lean on) now detects `.cif`/`.mmcif` and tells 3Dmol the real format instead of assuming PDB. Regression test posts a real mmCIF file through the Flask test client and checks the session doesn't still start with `data_` |
+
+Found by the user uploading a real mmCIF file and reporting the viewer stayed
+blank — a case none of the automated sweeps above exercised, since every
+verification script and stress test up to this point used `.pdb` fixtures.
+Confirmed against the actual file (RCSB entry `3OIE`) before and after the
+fix, both via a direct `/api/analyze` → `/api/history/pdb` round trip and
+live in the browser.
+
 ### Verified correct
 
 - Disulfide cysteines are left oxidised; no HG is added to a bridged SG.

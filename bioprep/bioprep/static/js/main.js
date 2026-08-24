@@ -147,10 +147,10 @@
     if (ext) ext.loseContext();
   }
 
-  function renderStructure(viewer, pdbText, style = "cartoon") {
+  function renderStructure(viewer, pdbText, style = "cartoon", format = "pdb") {
     if (!viewer) return;
     viewer.clear();
-    viewer.addModel(pdbText, "pdb");
+    viewer.addModel(pdbText, format);
     if (style === "cartoon") {
       viewer.setStyle({}, { cartoon: { color: "spectrum" }, stick: { radius: 0.12, hidden: true } });
       viewer.setStyle({ hetflag: true }, { stick: { colorscheme: "grayCarbon", radius: 0.18 } });
@@ -684,20 +684,35 @@
     }
 
     async function loadStructureForViewer(sessionId) {
+      // Everything /api/history/pdb serves has already gone through
+      // ensure_pdb() server-side, regardless of what was originally
+      // uploaded, so "pdb" is always the right format here.
       try {
         const text = await (await api(`/api/history/pdb/${sessionId}`)).text();
         if (!viewer) viewer = createViewer(qs("#sites-viewer"));
         if (viewer) renderStructure(viewer, text, "cartoon");
-      } catch (_) {}
+      } catch (err) {
+        toast(`Couldn't load the structure into the viewer: ${err.message}`, "rust");
+      }
     }
 
     function onFileChosen(file) {
       const form = new FormData();
       form.append("file", file);
       run({ url: "/api/analyze-site", init: { method: "POST", body: form } }, file.name);
+      // A direct upload here skips the server round trip that converts
+      // mmCIF for the viewer elsewhere, so the raw file text is handed to
+      // 3Dmol - which needs to be told the real format, or an mmCIF upload
+      // silently renders nothing (it gets parsed as if it were PDB).
+      const isMmcif = /\.(cif|mmcif)$/i.test(file.name);
       file.text().then((text) => {
         if (!viewer) viewer = createViewer(qs("#sites-viewer"));
-        if (viewer) renderStructure(viewer, text, "cartoon");
+        if (!viewer) return;
+        try {
+          renderStructure(viewer, text, "cartoon", isMmcif ? "cif" : "pdb");
+        } catch (err) {
+          toast(`Couldn't render this structure: ${err.message}`, "rust");
+        }
       });
     }
 

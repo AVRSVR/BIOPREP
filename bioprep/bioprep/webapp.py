@@ -24,7 +24,7 @@ from flask import Flask, render_template, request, send_file, jsonify
 from werkzeug.utils import secure_filename
 
 from bioprep.core.pipeline import PipelineSettings, prepare_structure
-from bioprep.core.io import load_pdb
+from bioprep.core.io import load_pdb, ensure_pdb
 from bioprep.core.analyzer import analyze_structure, detect_missing_residues
 from bioprep.core.reporter import report_to_text
 from bioprep.core.site_analyzer import BindingSiteAnalyzer
@@ -298,8 +298,14 @@ def analyze():
         metadata = analyze_structure(load_pdb(input_path))
         metadata['missing_residues'] = detect_missing_residues(input_path)
 
+        # The stored copy is served straight to the 3Dmol viewer (and to any
+        # /api/analyze-site/<session_id> call) as PDB - an mmCIF upload has to
+        # be converted here too, not just at /api/process time, or the viewer
+        # gets handed raw mmCIF text told to parse as PDB and silently shows
+        # nothing.
+        viewer_path, _ = ensure_pdb(input_path, workdir)
         session_id = str(uuid.uuid4())
-        _store_result(session_id, input_path)
+        _store_result(session_id, viewer_path)
 
         return jsonify({
             'success': True,
