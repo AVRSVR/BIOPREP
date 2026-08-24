@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024   # 200 MB
+# This is a single-user local tool (nothing served templates to more than one
+# client), so there's no reason to keep the compiled-template cache around;
+# it only made template edits silently invisible until a restart.
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

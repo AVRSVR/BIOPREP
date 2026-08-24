@@ -391,9 +391,14 @@
       const label = qs("#process-btn-label");
       btn.disabled = true;
       const original = label.textContent;
-      label.innerHTML = '<span class="spinner"></span> Processing…';
-
       const settings = gatherSettings();
+      const slowNotice = settings.run_minimization
+        ? " — minimisation can take a few minutes"
+        : settings.reconstruct_loops
+        ? " — loop reconstruction can take a while on large gaps"
+        : "";
+      label.innerHTML = `<span class="spinner"></span> Processing${slowNotice}…`;
+
       const form = new FormData();
       form.append("file", currentFile);
       form.append("ph", settings.ph);

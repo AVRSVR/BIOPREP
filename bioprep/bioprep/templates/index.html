@@ -116,7 +116,7 @@
                   <input type="checkbox" id="opt-reconstruct-loops">
                   <span>
                     <span class="check-text">Reconstruct missing loops</span>
-                    <div class="check-desc">Rebuild residues present in SEQRES but absent from coordinates</div>
+                    <div class="check-desc">Rebuild residues present in SEQRES but absent from coordinates. Slow on structures with large gaps.</div>
                   </span>
                 </label>
                 <label class="check-row">
@@ -133,7 +133,10 @@
               <div class="panel-title">Energy minimisation</div>
               <label class="check-row">
                 <input type="checkbox" id="opt-minimize">
-                <span class="check-text">Run energy minimisation</span>
+                <span>
+                  <span class="check-text">Run energy minimisation</span>
+                  <div class="check-desc">Runs on CPU for reproducibility, not GPU. Can take several minutes on larger structures.</div>
+                </span>
               </label>
               <div class="stack hidden" id="minimize-options" style="gap: var(--space-3); margin-top: var(--space-3)">
                 <label class="field">
@@ -147,7 +150,7 @@
                   <input type="checkbox" id="opt-gbsa" checked>
                   <span>
                     <span class="check-text">GBSA implicit solvent</span>
-                    <div class="check-desc">OBC2 generalised Born model</div>
+                    <div class="check-desc">OBC2 generalised Born model. The single biggest driver of minimisation time — turn off for a quicker, less physically complete pass.</div>
                   </span>
                 </label>
               </div>
