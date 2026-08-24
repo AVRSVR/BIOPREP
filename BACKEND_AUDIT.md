@@ -65,10 +65,24 @@ the repository root.
 cd tests && python -m unittest test_backend -v
 ```
 
-### Round 3 — analysis accuracy (not started)
+### Round 3 — analysis accuracy (done, verified)
 
-Outstanding: B10–B14 in `analyzer.py` and `site_analyzer.py`, plus B26, B27 in
-`exporter.py`, B28 verification, and B34/B42.
+| ID | Fix | Verification |
+|---|---|---|
+| B10 | `analyze_structure` reads the first model only, so an NMR ensemble no longer multiplies atom counts, water counts and gaps by the model count. | a 3-model file reports the same counts as 1 model |
+| B11 | `detect_missing_residues` maps PDBFixer's chain *index* through `topology.chains()`. It had been reading the key as `(model, chain_id)` and reporting an insert position as the chain. | a gap in chain B is labelled B, not 19 |
+| B12 | Pocket volume uses the grid resolution actually used, which `_detect_pockets` may coarsen. | doubling the grid multiplies volume by 8 |
+| B13 | Site analysis excludes hydrogens and waters; cavities are defined by heavy atoms. | 327 of 642 atoms used, no hydrogen survives the filter |
+| B14 | Pharmacophore features are ranked before the 40-cap, so backbone N/O yield to aromatic and sidechain features. | aromatics survive a cap of 6 |
+| B26 | `os.path.splitext` instead of `str.replace('.pdb', ...)`, which substituted every occurrence. | a directory named `my.pdb.data` is left intact |
+| B27 | `-xr` added, so the receptor is written rigid with no torsion tree. | ROOT/BRANCH absent; without it, 202 BRANCH records |
+| B28 | Ligand CONECT records carried through and remapped. | C1-C2, C2-O1, C2-N1 intact in the final output |
+| B34 | `--chain` uses `action="append"`, so a list reaches the selector instead of a string being substring-matched. | `--chain A --chain B` keeps exactly A and B |
+| B37 | Dead volume and drugability computation removed from `_detect_pockets`; `analyze()` was discarding it. | — |
+| B40 | The web app moved into the package as `bioprep.webapp`, with templates and static files as `package_data` and a `bioprep-web` console script. Mutable state moved out of the package to `BIOPREP_DATA_DIR` or the working directory, since site-packages is often read-only and a reinstall would delete the history. `bioprep/app.py` remains a source-checkout shim. | `GET /` returns 200 from the packaged templates; the shim still exposes `app` and its configuration |
+| B42 | `BioPrepSelect.accept_model` writes the first model only. | a 3-model ensemble writes one model's worth of atoms |
+
+Every ID in Table B is now either fixed above or recorded under "Known limits".
 
 ---
 

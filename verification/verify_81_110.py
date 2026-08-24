@@ -19,7 +19,8 @@ sys.path.insert(0, BIOPREP)
 os.chdir(BIOPREP)
 
 from bioprep.core import io as bio, cleaner                  # noqa: E402
-import app as webapp                                          # noqa: E402
+from bioprep import webapp                                    # noqa: E402
+import app as shim                                            # noqa: E402
 
 TMP = tempfile.mkdtemp(prefix="api_")
 P = lambda n: os.path.join(TMP, n)      # noqa: E731
@@ -69,9 +70,14 @@ def decode(b64):
 
 # ---- F81/F82: server and upload limit --------------------------------------
 check(81, "Flask application object exists", webapp.app is not None, "")
+check(81, "the bioprep/app.py shim still exposes the app and its config",
+      shim.app is webapp.app and shim.RESULTS_DIR == webapp.RESULTS_DIR, "")
 check(81, "index route registered",
       any(r.rule == "/" for r in webapp.app.url_map.iter_rules()), "")
-src = open("app.py").read()
+import inspect as _inspect                                     # noqa: E402
+# The application moved into the package so an installed copy can serve
+# it; bioprep/app.py is only a source-checkout shim now.
+src = _inspect.getsource(webapp)
 check(81, "served on port 5000", "port=5000" in src, "")
 check(81, "debug disabled", "debug=False" in src, "")
 check(82, "upload limit is 200 MB",
