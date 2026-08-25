@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024   # 200 MB
+
+# History and Templates are shared, unscoped state - /api/history returns the
+# last 50 jobs (filenames and full reports) to anyone who asks, and saved
+# templates are global too. Fine for one person on their own machine; on a
+# public deployment it means every visitor can see what every other visitor
+# uploaded. This flag turns both off without touching local usage at all.
+PUBLIC_DEMO = os.environ.get('BIOPREP_PUBLIC_DEMO', '').strip().lower() in ('1', 'true', 'yes')
 # This is a single-user local tool (nothing served templates to more than one
 # client), so there's no reason to keep the compiled-template cache around;
 # it only made template edits silently invisible until a restart.
@@ -324,7 +331,7 @@ def _settings_from_config():
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template('index.html', public_demo=PUBLIC_DEMO)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -641,8 +648,19 @@ def high_throughput():
 # History
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _demo_disabled():
+    return jsonify({'error': 'Disabled on this public deployment.'}), 404
+
+
 @app.route('/api/history', methods=['GET'])
 def list_history():
+    # The list itself is the leak: every job's filename and full report,
+    # unscoped to whoever submitted it. get_history_pdb (below) stays open -
+    # it only serves a structure to someone who already holds that specific
+    # session's own uuid, which this endpoint is what would otherwise hand
+    # out to everyone.
+    if PUBLIC_DEMO:
+        return _demo_disabled()
     return jsonify(jobs_store.read())
 
 
@@ -665,11 +683,15 @@ def get_history_pdb(job_id):
 
 @app.route('/api/templates', methods=['GET'])
 def get_templates():
+    if PUBLIC_DEMO:
+        return _demo_disabled()
     return jsonify(templates_store.read())
 
 
 @app.route('/api/templates', methods=['POST'])
 def save_template():
+    if PUBLIC_DEMO:
+        return _demo_disabled()
     data = request.get_json(silent=True) or {}
     name = str(data.get('name', '')).strip()
     if not name or 'settings' not in data:
@@ -689,6 +711,8 @@ def save_template():
 
 @app.route('/api/templates/<name>', methods=['DELETE'])
 def delete_template(name):
+    if PUBLIC_DEMO:
+        return _demo_disabled()
     def mutator(store):
         store.pop(name, None)
         return store

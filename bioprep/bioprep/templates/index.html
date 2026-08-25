@@ -29,12 +29,18 @@
       <button class="nav-item active" data-view="prepare"><span class="nav-dot"></span>Prepare</button>
       <button class="nav-item" data-view="sites"><span class="nav-dot"></span>Binding sites</button>
       <button class="nav-item" data-view="batch"><span class="nav-dot"></span>Batch</button>
+      {% if not public_demo %}
       <button class="nav-item" data-view="history"><span class="nav-dot"></span>History</button>
       <button class="nav-item" data-view="templates"><span class="nav-dot"></span>Templates</button>
+      {% endif %}
     </nav>
 
     <div class="nav-footer">
+      {% if public_demo %}
+      Hosted demo — uploads are processed on the server, not your machine.
+      {% else %}
       Structures are processed locally.<br>Nothing leaves this machine.
+      {% endif %}
     </div>
   </aside>
 

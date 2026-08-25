@@ -77,6 +77,56 @@ class TestAnalyzeRoute(unittest.TestCase):
                              'converted PDB does not carry the same atoms as the source')
 
 
+class TestPublicDemoGate(unittest.TestCase):
+    """BIOPREP_PUBLIC_DEMO=1 turns off the two routes that leak across visitors.
+
+    /api/history returns every job's filename and full report to anyone, and
+    saved templates are global too - fine on one person's own machine, a
+    real cross-visitor leak on a shared public deployment. get_history_pdb is
+    deliberately NOT gated: the Prepare/Sites viewer depends on it to load
+    back the structure from the session id its own /api/analyze or
+    /api/process call just returned, and that id isn't discoverable without
+    already having it.
+    """
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_history_and_templates_disabled_under_public_demo(self):
+        import bioprep.webapp as webapp
+        with mock.patch.object(webapp, 'PUBLIC_DEMO', True):
+            self.assertEqual(self.client.get('/api/history').status_code, 404)
+            self.assertEqual(self.client.get('/api/templates').status_code, 404)
+            self.assertEqual(
+                self.client.post('/api/templates', json={'name': 'x', 'settings': {}}).status_code, 404)
+            self.assertEqual(self.client.delete('/api/templates/x').status_code, 404)
+
+    def test_history_and_templates_open_by_default(self):
+        self.assertEqual(self.client.get('/api/history').status_code, 200)
+        self.assertEqual(self.client.get('/api/templates').status_code, 200)
+
+    def test_history_pdb_by_id_stays_open_under_public_demo(self):
+        """Gating the list must not gate the viewer's own fetch-by-id call."""
+        import bioprep.webapp as webapp
+        with mock.patch.object(webapp, 'PUBLIC_DEMO', True):
+            with tempfile.TemporaryDirectory(prefix='bioprep_test_') as tmp:
+                cif_path = _crn_as_mmcif(os.path.join(tmp, 'crn.cif'))
+                with open(cif_path, 'rb') as fh:
+                    resp = self.client.post('/api/analyze', data={'file': (fh, 'crn.cif')},
+                                            content_type='multipart/form-data')
+            session_id = resp.get_json()['session_id']
+            self.assertEqual(
+                self.client.get(f'/api/history/pdb/{session_id}').status_code, 200)
+
+    def test_nav_and_footer_reflect_public_demo(self):
+        import bioprep.webapp as webapp
+        with mock.patch.object(webapp, 'PUBLIC_DEMO', True):
+            html = self.client.get('/').get_data(as_text=True)
+        self.assertNotIn('data-view="history"', html)
+        self.assertNotIn('data-view="templates"', html)
+        self.assertIn('Hosted demo', html)
+
+
 class TestFetchByPdbId(unittest.TestCase):
     """/api/analyze with pdb_id instead of a file upload.
 
