@@ -34,9 +34,87 @@ import os
 import tempfile
 
 from pdbfixer import PDBFixer
-from openmm.app import PDBFile
+from openmm.app import Modeller, PDBFile
 
 from .residues import is_standard, is_water
+from .io import normalize_element_column_case
+
+# PROPKA-reported residue type -> (protonated variant, deprotonated/neutral
+# variant). Histidine only gets the protonated override forced explicitly;
+# its neutral form is two tautomers (HID/HIE) that OpenMM's Modeller already
+# picks correctly from local hydrogen-bond geometry when left at None, and
+# guessing that ourselves from a single pKa would throw that away for no
+# reason. Arginine and tyrosine are deliberately absent: arginine's pKa is
+# so high it is never practically neutral, and tyrosine has no anionic
+# template in either force field this tool offers (see BACKEND_AUDIT.md) -
+# PROPKA could recommend deprotonating it and there would be nothing to act
+# on.
+PROPKA_VARIANTS = {
+    'ASP': ('ASH', 'ASP'),
+    'GLU': ('GLH', 'GLU'),
+    'LYS': ('LYS', 'LYN'),
+    'HIS': ('HIP', None),
+}
+
+
+def _propka_variants(protein_only_path, topology, ph):
+    """
+    Ask PROPKA for structure-specific pKa values and turn them into an
+    OpenMM Modeller ``variants`` list, aligned to ``topology.residues()``.
+
+    PDBFixer's own addMissingHydrogens(pH) uses a fixed, model-compound pKa
+    per residue type - correct nowhere a residue's local environment (burial,
+    a salt bridge, a nearby charge) shifts its real pKa, which is exactly the
+    situation that matters most for a catalytic or buried residue. PROPKA
+    predicts a pKa per titratable group from the actual 3D structure; this
+    turns that prediction into the same override mechanism the CLI-level
+    'variants' parameter already supports; see BACKEND_AUDIT.md.
+
+    Returns (variants_or_None, adjustments). variants is None if PROPKA
+    itself failed - callers should fall back to the default, unmodified
+    behaviour rather than losing protonation entirely. adjustments describes
+    every residue whose state differs from what pH-only defaulting would
+    have chosen, for the report.
+    """
+    from propka.run import single as propka_single
+
+    mol = propka_single(protein_only_path, optargs=['--quiet'], write_pka=False)
+    conformation = next(iter(mol.conformations.values()))
+
+    pka_by_residue = {}
+    for group in conformation.groups:
+        resname = group.residue_type
+        if resname not in PROPKA_VARIANTS:
+            continue
+        atom = group.atom
+        key = (atom.chain_id, str(atom.res_num), resname)
+        pka_by_residue[key] = group.pka_value
+
+    variants = []
+    adjustments = []
+    for residue in topology.residues():
+        key = (residue.chain.id, residue.id, residue.name)
+        pka = pka_by_residue.get(key)
+        if pka is None:
+            variants.append(None)
+            continue
+        protonated_variant, neutral_variant = PROPKA_VARIANTS[residue.name]
+        should_protonate = pka > ph
+        variant = protonated_variant if should_protonate else neutral_variant
+        variants.append(variant)
+        # Default-pH-only behaviour would protonate ASP/GLU below ~4 and LYS
+        # above ~10.5; report only where PROPKA's structure-specific value
+        # actually disagrees with that model-compound default, so the report
+        # highlights what PROPKA changed rather than every titratable group.
+        default_pka = {'ASP': 3.9, 'GLU': 4.3, 'LYS': 10.5, 'HIS': 6.5}[residue.name]
+        if (pka > ph) != (default_pka > ph):
+            adjustments.append({
+                'residue': f'{residue.name}{residue.id}',
+                'chain': residue.chain.id,
+                'propka_pka': round(pka, 2),
+                'state': 'protonated' if should_protonate else 'deprotonated/neutral',
+            })
+    return variants, adjustments
 
 # A residue can be missing more than its sidechain - real deposited structures
 # routinely have a chain terminus with no density past the amide nitrogen, so
@@ -192,7 +270,8 @@ def _merge(protein_pdb_path, ligand_lines, ligand_conect, output_path):
 
 
 def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
-                  reconstruct_loops=False, add_missing_atoms=False):
+                  reconstruct_loops=False, add_missing_atoms=False,
+                  use_propka=False):
     """
     Add hydrogens at the given pH, protecting ligands from PDBFixer.
 
@@ -216,6 +295,8 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
         'nonstandard_replaced': [],
         'terminals_repaired': 0,
         'loops_reconstructed': 0,
+        'propka_used': False,
+        'propka_adjustments': [],
         'warnings': [],
     }
 
@@ -320,14 +401,46 @@ def add_hydrogens(input_pdb_path, output_pdb_path, ph=7.4,
 
         fixer.addMissingAtoms()
 
+        variants = None
+        if use_propka:
+            try:
+                variants, adjustments = _propka_variants(protein_only, fixer.topology, ph)
+                result['propka_used'] = True
+                result['propka_adjustments'] = adjustments
+                if adjustments:
+                    result['warnings'].append(
+                        f"PROPKA shifted the protonation state of {len(adjustments)} "
+                        "residue(s) away from the default pH-only assignment based on "
+                        "their local structural environment: "
+                        + ', '.join(f"{a['residue']} ({a['state']}, pKa {a['propka_pka']})"
+                                    for a in adjustments)
+                    )
+            except Exception as exc:
+                result['warnings'].append(
+                    f"PROPKA-based pKa prediction failed ({exc}); used default "
+                    "model-compound pKa values instead."
+                )
+
         try:
-            fixer.addMissingHydrogens(ph)
+            if variants is not None:
+                # Same call PDBFixer's own addMissingHydrogens(ph) makes
+                # internally - reproduced here rather than forked, so the
+                # PROPKA-driven override list can replace its default
+                # per-residue variant selection for exactly the residues
+                # PROPKA actually disagreed with.
+                modeller = Modeller(fixer.topology, fixer.positions)
+                modeller.addHydrogens(pH=ph, variants=variants, platform=fixer.platform)
+                fixer.topology = modeller.topology
+                fixer.positions = modeller.positions
+            else:
+                fixer.addMissingHydrogens(ph)
             result['hydrogens_added'] = True
         except Exception as exc:
             result['warnings'].append(f"Hydrogen addition failed: {exc}")
 
         with open(protonated, 'w') as fh:
             PDBFile.writeFile(fixer.topology, fixer.positions, fh, keepIds=True)
+        normalize_element_column_case(protonated)
 
         _merge(protonated, ligand_lines, ligand_conect, output_pdb_path)
 

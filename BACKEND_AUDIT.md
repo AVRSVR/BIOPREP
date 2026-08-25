@@ -376,10 +376,55 @@ live in the browser.
 ### Known limits, not fixed
 
 - **Tyrosine is never deprotonated.** Confirmed by inspecting the template inventories directly, not inferred: `ForceField('amber14-all.xml')` defines `TYR`, `NTYR`, `CTYR` and nothing else for tyrosine — no anionic form, unlike histidine's `HID`/`HIE`/`HIP` or lysine's `LYS`/`LYN`. CHARMM36 has an `STYR` template that looked like a candidate, but it has 16 atoms against `TYR`'s 21 and **no OH or HH atom at all** — it is some other truncated variant, not a tyrosinate. Neither force field this tool offers gives PDBFixer anywhere to select a deprotonated state from, so this cannot be fixed by changing how the protonator calls it; it would need a different hydrogen-placement engine entirely.
-- **pKa values are model-compound values, by the library's own design.** `PDBFixer.addMissingHydrogens`'s docstring states it directly: *"No extensive electrostatic analysis is performed; only default residue pKas are used. The pH is only taken into account for standard amino acids."* A buried or salt-bridged residue with a pKa shifted by several units gets the model-compound state regardless — worst exactly where it matters, at a catalytic residue. Fixing this means adding a structure-specific predictor (PROPKA or similar) ahead of PDBFixer, not a change to this tool's own code.
 - **The drugability score is an unvalidated heuristic.** On 1HSG the real inhibitor site is found (6.2 Å, largest volume, lined by the catalytic Asp dyad and flap) but ranks **last of five**: the volume term penalises it for exceeding 300–1000 Å³ and concavity for being an open cavity — the very properties that let it bind a peptidomimetic. Two of the five factors, property diversity and pharmacophore density, are 1.00 for every pocket and do no discriminating work. The five sub-scores are returned per pocket so the ranking can be argued with; the weights were deliberately **not** retuned, since fitting them to two structures would be overfitting dressed as improvement.
-- **Ligands are never parameterised.** Tier 2 excludes them rather than generating GAFF or CGenFF parameters, so a ligand's internal geometry is never optimised.
-- **The element column's case is inconsistent between writers.** RCSB and our own `SpecCompliantPDBIO` write `ZN`; OpenMM's own `PDBFile.writeFile`, used for every post-protonation and post-minimisation file, writes `Zn`. Both identify the correct element to every tool checked (OpenMM, OpenBabel), unlike the earlier column-offset bug that actually changed which element was read. Left alone rather than post-processing every OpenMM-written file to re-case a column that nothing downstream cares about.
+- **Ligands are never parameterised.** Tier 2 excludes them rather than generating GAFF or CGenFF parameters, so a ligand's internal geometry is never optimised. Unlike the pKa and element-casing items below, this one is a genuinely large scope (atom typing, charge assignment, force field XML generation per arbitrary ligand — effectively a GAFF/OpenFF integration) and was deliberately left out of this pass rather than attempted half-scoped.
+
+## Feature additions
+
+**Fetch by PDB id.** `/api/analyze` now accepts a `pdb_id` form field as an
+alternative to a file upload: validates the 4-character format, downloads
+from `files.rcsb.org` (legacy PDB first, falling back to mmCIF for entries
+deposited without one — e.g. `30IE`, the cryo-EM structure elsewhere in this
+document, has no legacy PDB rendering), and feeds the result through the
+exact same `ensure_pdb`/`analyze_structure` path a file upload would. Every
+network call in the test suite (`tests/test_webapp.py::TestFetchByPdbId`) is
+mocked — bad format, the 404-then-mmCIF fallback, and a network-level
+failure not retrying against the second format — so the suite stays fast
+and doesn't depend on RCSB being reachable.
+
+**PROPKA-based, structure-specific pKa.** A new `use_propka` setting runs
+PROPKA on the cleaned structure before protonation and turns its per-residue
+pKa predictions into overrides on OpenMM Modeller's `variants` parameter —
+the same mechanism `Modeller.addHydrogens()` already exposes for forcing
+ASH/ASP, GLH/GLU, HIP, or LYN/LYS on a specific residue, previously unused
+because PDBFixer's own `addMissingHydrogens(pH)` builds that list from
+nothing but the fixed pH. Histidine only gets the *protonated* override
+forced; its neutral tautomer (HID vs HIE) is left to OpenMM's existing
+hydrogen-bond-geometry logic rather than guessed from one pKa number.
+Tyrosine and arginine are deliberately excluded — tyrosine because there is
+still no anionic template to switch to (the limitation above), arginine
+because its pKa is high enough that it is never practically neutral.
+
+Verified against the exact case the "known limit" this replaces called out
+as the worst failure mode: on 1HSG (chain B), PROPKA predicts **pKa 9.06**
+for the catalytic **Asp25**, against the amber14 default of ~3.9 — meaning
+default protonation would deprotonate the very residue whose protonation
+state defines the catalytic mechanism, while PROPKA correctly keeps it
+protonated at physiological pH. Confirmed at the atom level: the written
+PDB carries `HD2` on `OD2` of that residue, the extra hydrogen the ASH
+(protonated) variant adds and the default ASP variant does not. A PROPKA
+failure (any exception) falls back to the previous default-pH behaviour
+with a warning, rather than losing protonation for the whole structure.
+
+**Element column case, actually fixed this time.** `io.normalize_element_column_case()`
+upper-cases the element column (77–78) of every ATOM/HETATM line after
+OpenMM writes a file — called from both the post-protonation write and the
+post-minimisation write, the two places `PDBFile.writeFile` runs. Previously
+left alone on the reasoning that nothing downstream cared about the case;
+still true, but the fix costs one file pass now, so there is no longer a
+reason to leave the inconsistency documented instead of closed. Verified
+against 4INS's real zinc ions through the full pipeline including
+minimisation, not just the write step in isolation.
 
 ## Performance: GPU-accelerated minimisation
 

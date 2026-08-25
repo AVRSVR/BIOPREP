@@ -211,6 +211,7 @@
         <label class="check-row"><input type="checkbox" id="${idPrefix}-structural-water"><span class="check-text">Keep structural waters</span></label>
         <label class="check-row"><input type="checkbox" id="${idPrefix}-loops"><span class="check-text">Reconstruct missing loops</span></label>
         <label class="check-row"><input type="checkbox" id="${idPrefix}-missing-atoms"><span class="check-text">Add missing heavy atoms</span></label>
+        <label class="check-row"><input type="checkbox" id="${idPrefix}-propka"><span class="check-text">PROPKA structure-specific pKa</span></label>
         <label class="check-row"><input type="checkbox" id="${idPrefix}-minimize"><span class="check-text">Run energy minimisation</span></label>
         <div class="stack hidden" id="${idPrefix}-minimize-options" style="gap:var(--space-3);padding-left:23px">
           <label class="field">
@@ -255,6 +256,7 @@
       keep_structural_waters: val("structural-water").checked,
       reconstruct_loops: val("loops").checked,
       add_missing_atoms: val("missing-atoms").checked,
+      use_propka: val("propka").checked,
       run_minimization: val("minimize").checked,
       force_field: val("force-field").value,
       use_gbsa: val("gbsa").checked,
@@ -288,9 +290,39 @@
     }
 
     async function onFileChosen(file) {
-      currentFile = file;
+      await runAnalyze(() => {
+        const form = new FormData();
+        form.append("file", file);
+        return form;
+      }, file.name, async () => file);
+    }
+
+    // /api/process still takes a real file body, so a PDB-id fetch (no local
+    // File to begin with) pulls the converted structure /api/analyze already
+    // stored and wraps it as one - the rest of the Prepare flow, including
+    // re-processing with different settings, then works unmodified.
+    async function fetchByPdbId(id) {
+      const btn = qs("#prepare-pdbid-btn");
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Fetching…";
+      try {
+        const form = new FormData();
+        form.append("pdb_id", id);
+        await runAnalyze(() => form, id.toUpperCase(), async (data) => {
+          const text = await (await api(`/api/history/pdb/${data.session_id}`)).text();
+          return new File([text], data.filename.replace(/\.(cif|mmcif)$/i, ".pdb"),
+                          { type: "chemical/x-pdb" });
+        });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function runAnalyze(buildForm, displayName, buildCurrentFile) {
       qs("#prepare-file-chip").innerHTML =
-        `${escapeHtml(file.name)} <button id="prepare-file-clear" title="Remove">${ICON.x}</button>`;
+        `${escapeHtml(displayName)} <button id="prepare-file-clear" title="Remove">${ICON.x}</button>`;
       qs("#prepare-upload").classList.add("hidden");
       qs("#prepare-workspace").classList.remove("hidden");
       stopHeroSpin();
@@ -301,9 +333,8 @@
       summaryEl.innerHTML = `<div class="row" style="color:var(--ink-faint);font-size:12.5px"><span class="spinner"></span>Analysing…</div>`;
 
       try {
-        const form = new FormData();
-        form.append("file", file);
-        const data = await apiJson("/api/analyze", { method: "POST", body: form });
+        const data = await apiJson("/api/analyze", { method: "POST", body: buildForm() });
+        currentFile = await buildCurrentFile(data);
         sessionId = data.session_id;
         metadata = data.metadata;
         renderAnalysis();
@@ -311,6 +342,7 @@
       } catch (err) {
         summaryEl.innerHTML = "";
         toast(err.message, "rust");
+        reset();
       }
     }
 
@@ -423,6 +455,7 @@
         keep_structural_waters: qs("#opt-structural-water").checked,
         reconstruct_loops: qs("#opt-reconstruct-loops").checked,
         add_missing_atoms: qs("#opt-missing-atoms").checked,
+        use_propka: qs("#opt-propka").checked,
         run_minimization: qs("#opt-minimize").checked,
         use_gbsa: qs("#opt-gbsa").checked,
         force_field: qs("#opt-force-field").value,
@@ -442,6 +475,8 @@
         ? " — minimisation can take a few minutes"
         : settings.reconstruct_loops
         ? " — loop reconstruction can take a while on large gaps"
+        : settings.use_propka
+        ? " — PROPKA analysis takes a bit longer than default protonation"
         : "";
       label.innerHTML = `<span class="spinner"></span> Processing${slowNotice}…`;
 
@@ -452,6 +487,7 @@
       form.append("keep_structural_waters", settings.keep_structural_waters);
       form.append("reconstruct_loops", settings.reconstruct_loops);
       form.append("add_missing_atoms", settings.add_missing_atoms);
+      form.append("use_propka", settings.use_propka);
       form.append("run_minimization", settings.run_minimization);
       form.append("use_gbsa", settings.use_gbsa);
       form.append("force_field", settings.force_field);
@@ -520,10 +556,18 @@
         ["Nonstandard replaced", (prot.nonstandard_replaced || []).join(", ") || "None"],
         ["Loops rebuilt", fmtNum(prot.loops_reconstructed || 0, 0)],
         ["Terminals repaired", fmtNum(prot.terminals_repaired || 0, 0)],
+        ["PROPKA used", prot.propka_used ? "Yes" : "No"],
       ];
       protRows.forEach(([k, v]) => {
         const row = el("div", "kv-row");
         row.innerHTML = `<span class="kv-key">${k}</span><span class="kv-val">${escapeHtml(String(v))}</span>`;
+        protEl.appendChild(row);
+      });
+      (prot.propka_adjustments || []).forEach((a) => {
+        const row = el("div", "kv-row");
+        row.style.color = "var(--ink-soft)";
+        row.innerHTML = `<span class="kv-key">  ${escapeHtml(a.chain)}/${escapeHtml(a.residue)}</span>` +
+          `<span class="kv-val">${escapeHtml(a.state)} (pKa ${escapeHtml(String(a.propka_pka))})</span>`;
         protEl.appendChild(row);
       });
 
@@ -605,6 +649,13 @@
     function init() {
       wireDropzone(qs("#prepare-dropzone"), qs("#prepare-file-input"), onFileChosen);
       qs("#prepare-reset-btn").addEventListener("click", reset);
+      const pdbIdInput = qs("#prepare-pdbid-input");
+      const submitPdbId = () => {
+        const id = pdbIdInput.value.trim();
+        if (id) fetchByPdbId(id);
+      };
+      qs("#prepare-pdbid-btn").addEventListener("click", submitPdbId);
+      pdbIdInput.addEventListener("keydown", (e) => { if (e.key === "Enter") submitPdbId(); });
       qs("#ph-slider").addEventListener("input", (e) => {
         qs("#ph-readout").textContent = e.target.value;
       });
@@ -637,6 +688,7 @@
       if ("keep_structural_waters" in settings) qs("#opt-structural-water").checked = !!settings.keep_structural_waters;
       if ("reconstruct_loops" in settings) qs("#opt-reconstruct-loops").checked = !!settings.reconstruct_loops;
       if ("add_missing_atoms" in settings) qs("#opt-missing-atoms").checked = !!settings.add_missing_atoms;
+      if ("use_propka" in settings) qs("#opt-propka").checked = !!settings.use_propka;
       if ("run_minimization" in settings) {
         qs("#opt-minimize").checked = !!settings.run_minimization;
         qs("#minimize-options").classList.toggle("hidden", !settings.run_minimization);

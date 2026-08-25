@@ -53,6 +53,8 @@ def build_report(
             "nonstandard_replaced": protonation.get("nonstandard_replaced", []),
             "loops_reconstructed": protonation.get("loops_reconstructed", 0),
             "terminals_repaired": protonation.get("terminals_repaired", 0),
+            "propka_used": protonation.get("propka_used", False),
+            "propka_adjustments": protonation.get("propka_adjustments", []),
         },
         # Kept at the top level for backwards compatibility with older readers.
         "hydrogens_added": protonation.get("hydrogens_added", False),
@@ -132,7 +134,15 @@ def report_to_text(report):
         f"  Nonstandard Fixed : {_join(protonation.get('nonstandard_replaced'))}",
         f"  Loops Rebuilt     : {protonation.get('loops_reconstructed', 0)}",
         f"  Terminals Repaired: {protonation.get('terminals_repaired', 0)}",
+        f"  PROPKA Used       : {protonation.get('propka_used', False)}",
     ]
+
+    for entry in protonation.get("propka_adjustments") or []:
+        lines.append(
+            f"    {entry.get('chain', '?')}/{entry.get('residue', '?')}: "
+            f"{entry.get('state', '?')} (PROPKA pKa {entry.get('propka_pka', '?')}, "
+            "differs from the default model-compound value)"
+        )
 
     # Explain the protected ligands rather than just naming them: coming out
     # with no hydrogens looks like a failure unless the reason is stated.

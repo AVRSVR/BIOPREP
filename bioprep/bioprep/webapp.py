@@ -12,9 +12,12 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from collections import OrderedDict
@@ -241,11 +244,56 @@ def _require_pdb_upload(field='file'):
     return upload, None
 
 
+PDB_ID_PATTERN = re.compile(r'^[0-9][A-Za-z0-9]{3}$')
+RCSB_FETCH_TIMEOUT = 20
+
+
+def _fetch_pdb_by_id(pdb_id, workdir):
+    """
+    Download a structure straight from RCSB by its 4-character id.
+
+    Tries legacy PDB format first, then mmCIF - some entries (typically
+    large assemblies or cryo-EM structures, like 30IE elsewhere in this
+    project's own testing) are deposited without a legacy PDB rendering at
+    all and only 404 on that format, not on mmCIF.
+
+    Returns (local_path, filename). Raises ValueError with a message safe to
+    show the user on a bad id, a 404, or a network failure - the caller
+    already knows how to turn that into a clean JSON error.
+    """
+    pdb_id = pdb_id.strip()
+    if not PDB_ID_PATTERN.match(pdb_id):
+        raise ValueError(
+            f"'{pdb_id}' doesn't look like a PDB id - it should be 4 "
+            "characters, starting with a digit (e.g. 1HSG).")
+    pdb_id = pdb_id.upper()
+
+    errors = []
+    for ext in ('pdb', 'cif'):
+        url = f'https://files.rcsb.org/download/{pdb_id}.{ext}'
+        dest = os.path.join(workdir, f'{pdb_id}.{ext}')
+        try:
+            with urllib.request.urlopen(url, timeout=RCSB_FETCH_TIMEOUT) as resp:
+                with open(dest, 'wb') as fh:
+                    shutil.copyfileobj(resp, fh)
+            return dest, f'{pdb_id}.{ext}'
+        except urllib.error.HTTPError as exc:
+            errors.append(f'{ext.upper()}: HTTP {exc.code}')
+        except urllib.error.URLError as exc:
+            # Not worth trying the other format too - the network itself is
+            # the problem, not the format.
+            raise ValueError(f'Could not reach RCSB ({exc.reason}).')
+
+    raise ValueError(
+        f"RCSB has no entry '{pdb_id}' in a format this tool reads "
+        f"({'; '.join(errors)}). Check the id, or upload the file directly.")
+
+
 def _settings_from_form():
     """Precision mode posts a flat multipart form."""
     data = {}
     for key in ('remove_water', 'keep_structural_waters', 'reconstruct_loops',
-                'add_missing_atoms', 'run_minimization', 'use_gbsa',
+                'add_missing_atoms', 'run_minimization', 'use_gbsa', 'use_propka',
                 'ph', 'force_field', 'docking_target'):
         if key in request.form:
             data[key] = request.form.get(key)
@@ -285,15 +333,23 @@ def index():
 
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
-    """Return structural metadata for an uploaded PDB without processing it."""
-    upload, error = _require_pdb_upload()
-    if error:
-        return error
+    """Return structural metadata for a PDB, uploaded or fetched by id, without processing it."""
+    pdb_id = request.form.get('pdb_id', '').strip()
+    if not pdb_id:
+        upload, error = _require_pdb_upload()
+        if error:
+            return error
 
     workdir = tempfile.mkdtemp(prefix='bioprep_analyze_')
     try:
-        input_path = os.path.join(workdir, secure_filename(upload.filename))
-        upload.save(input_path)
+        if pdb_id:
+            # Raises ValueError on a bad id, a 404, or an unreachable RCSB -
+            # caught below and reported the same way a bad upload would be.
+            input_path, filename = _fetch_pdb_by_id(pdb_id, workdir)
+        else:
+            filename = secure_filename(upload.filename)
+            input_path = os.path.join(workdir, filename)
+            upload.save(input_path)
 
         metadata = analyze_structure(load_pdb(input_path))
         metadata['missing_residues'] = detect_missing_residues(input_path)
@@ -309,13 +365,13 @@ def analyze():
 
         return jsonify({
             'success': True,
-            'filename': secure_filename(upload.filename),
+            'filename': filename,
             'metadata': metadata,
             'session_id': session_id,
         })
     except ValueError as exc:
-        # Unreadable or non-PDB upload: the user can fix this, so say what is
-        # wrong rather than returning a generic 500.
+        # Unreadable/non-PDB upload, bad id, or a fetch failure: the user can
+        # fix this, so say what is wrong rather than returning a generic 500.
         return _fail(str(exc))
     except Exception as exc:
         return _server_error('Analysis failed', exc)

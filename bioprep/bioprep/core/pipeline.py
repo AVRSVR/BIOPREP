@@ -41,6 +41,7 @@ class PipelineSettings:
     use_gbsa: bool = True
     force_field: str = 'amber14'
     docking_target: Optional[str] = None
+    use_propka: bool = False
 
     @classmethod
     def from_mapping(cls, data):
@@ -101,6 +102,7 @@ class PipelineSettings:
             use_gbsa=as_bool('use_gbsa', True),
             force_field=force_field,
             docking_target=docking,
+            use_propka=as_bool('use_propka', False),
         )
 
     def to_dict(self):
@@ -187,6 +189,7 @@ def prepare_structure(input_path, workdir, settings, original_filename=None):
         ph=settings.ph,
         reconstruct_loops=settings.reconstruct_loops,
         add_missing_atoms=settings.add_missing_atoms,
+        use_propka=settings.use_propka,
     )
     warnings.extend(protonation['warnings'])
 

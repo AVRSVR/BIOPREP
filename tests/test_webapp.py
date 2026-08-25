@@ -6,9 +6,12 @@ show up at the Flask route layer - request handling, session storage, what
 gets served back to the browser - rather than inside the pipeline itself.
 """
 
+import io
 import os
 import tempfile
 import unittest
+import unittest.mock as mock
+import urllib.error
 
 import conftest  # noqa: F401  - sets up sys.path
 
@@ -72,6 +75,61 @@ class TestAnalyzeRoute(unittest.TestCase):
             atom_lines = [l for l in text.splitlines() if l.startswith('ATOM')]
             self.assertEqual(len(atom_lines), 327,
                              'converted PDB does not carry the same atoms as the source')
+
+
+class TestFetchByPdbId(unittest.TestCase):
+    """/api/analyze with pdb_id instead of a file upload.
+
+    Network calls are mocked throughout - real RCSB access is exercised
+    manually (see BACKEND_AUDIT.md), not on every test run, so the suite
+    stays fast and doesn't fail in an offline CI environment.
+    """
+
+    def setUp(self):
+        self.client = app.test_client()
+
+    def test_bad_id_format_is_rejected_without_a_network_call(self):
+        with mock.patch('urllib.request.urlopen', side_effect=AssertionError(
+                'should not have tried the network for an invalid id')) as m:
+            resp = self.client.post('/api/analyze', data={'pdb_id': 'nope!'})
+        m.assert_not_called()
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('id', resp.get_json()['error'])
+
+    def test_no_legacy_pdb_falls_back_to_mmcif(self):
+        """Some entries (large assemblies, cryo-EM) 404 on .pdb but not .cif."""
+        cif_path = _crn_as_mmcif(os.path.join(tempfile.mkdtemp(), 'crn.cif'))
+        with open(cif_path, 'rb') as fh:
+            cif_bytes = fh.read()
+
+        def fake_urlopen(url, timeout=None):
+            if url.endswith('.pdb'):
+                raise urllib.error.HTTPError(url, 404, 'Not Found', {}, None)
+            return io.BytesIO(cif_bytes)
+
+        with mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            resp = self.client.post('/api/analyze', data={'pdb_id': '1abc'})
+
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        data = resp.get_json()
+        self.assertEqual(data['filename'], '1ABC.cif')
+        self.assertEqual(data['metadata']['atoms_total'], 327)
+
+    def test_network_failure_does_not_try_the_second_format(self):
+        attempted = []
+
+        def fake_urlopen(url, timeout=None):
+            attempted.append(url)
+            raise urllib.error.URLError('name resolution failed')
+
+        with mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            resp = self.client.post('/api/analyze', data={'pdb_id': '1abc'})
+
+        self.assertEqual(len(attempted), 1,
+                         'tried a second format after a network-level failure, '
+                         'not just a 404 - the format was never the problem')
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('RCSB', resp.get_json()['error'])
 
 
 if __name__ == '__main__':

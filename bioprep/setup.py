@@ -25,7 +25,8 @@ setup(
         "werkzeug",
         "numpy",
         "scipy",
-        "scikit-learn"
+        "scikit-learn",
+        "propka>=3.5"
     ],
     entry_points={
         "console_scripts": [

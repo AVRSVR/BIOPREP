@@ -5,3 +5,4 @@ flask
 werkzeug
 scipy
 scikit-learn
+propka>=3.5

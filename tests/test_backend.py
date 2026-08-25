@@ -104,6 +104,23 @@ class TestIO(TempDirTest):
         with self.assertRaises(ValueError):
             io.load_pdb(cif)
 
+    def test_element_column_case_is_normalised(self):
+        """OpenMM's PDBFile.writeFile writes 'Zn'; RCSB and this project's own
+        writer use 'ZN'. Both identify the correct element to every tool this
+        project checked, but the inconsistency is fixed wherever it's now
+        nearly free rather than left as a footnote."""
+        mixed_case_zn = ('HETATM 9001 ZN    ZN A 900      10.000  10.000  10.000'
+                         '  1.00  0.00          Zn\n')
+        already_upper = ('HETATM 9002  C1  LIG A 901      12.000  10.000  10.000'
+                         '  1.00  0.00           C\n')
+        path = _write(self.path('mixed.pdb'), [mixed_case_zn, already_upper])
+
+        io.normalize_element_column_case(path)
+
+        lines = pathlib.Path(path).read_text().splitlines()
+        self.assertEqual(lines[0][76:78], 'ZN')
+        self.assertEqual(lines[1][76:78], ' C', 'an already-correct column must be left alone')
+
 
 class TestSavePdb(TempDirTest):
     """Features 3 and 4: PDBIO saving, and saving through a Select filter."""
@@ -1082,6 +1099,103 @@ class TestProtonationFeatures(TempDirTest):
         numbers = [int(l[22:26]) for l in written
                    if l.startswith('ATOM') and l[21] == 'A']
         self.assertEqual((min(numbers), max(numbers)), (1, 46))
+
+
+class TestPropkaIntegration(TempDirTest):
+    """use_propka=True: structure-specific pKa instead of model-compound defaults."""
+
+    def test_propka_runs_and_is_reported(self):
+        """The mechanism works end to end on an ordinary structure.
+
+        1CRN itself has no titratable group whose environment shifts its pKa
+        enough to disagree with the default, so no adjustment is expected
+        here - that real case (HIV protease's catalytic ASP25, pKa 9.06
+        against a default of ~3.9) is documented in BACKEND_AUDIT.md against
+        a real deposited structure instead, not reproduced as a unit test
+        fixture.
+        """
+        source = _write(self.path('in.pdb'), _protein_lines())
+        result = protonator.add_hydrogens(source, self.path('out.pdb'), use_propka=True)
+        self.assertTrue(result['hydrogens_added'])
+        self.assertTrue(result['propka_used'])
+        self.assertIsInstance(result['propka_adjustments'], list)
+
+    def test_propka_failure_falls_back_to_default_protonation(self):
+        """A broken PROPKA must not take protonation down with it."""
+        import unittest.mock as mock
+        source = _write(self.path('in.pdb'), _protein_lines())
+
+        with mock.patch('propka.run.single', side_effect=RuntimeError('propka blew up')):
+            result = protonator.add_hydrogens(source, self.path('out.pdb'), use_propka=True)
+
+        self.assertTrue(result['hydrogens_added'],
+                        'a PROPKA failure must not prevent protonation entirely')
+        self.assertFalse(result['propka_used'])
+        self.assertTrue(any('PROPKA' in w for w in result['warnings']))
+
+    def test_forced_variant_actually_changes_the_written_atoms(self):
+        """An overridden variant must reach the atoms OpenMM actually writes.
+
+        Mocked rather than relying on PROPKA's own numeric prediction for a
+        specific residue, which could shift between propka versions - this
+        tests that this project's own wiring from a pKa decision to a
+        Modeller variant override is correct, independent of PROPKA's model.
+        """
+        import unittest.mock as mock
+        lines = _protein_lines()
+        # Find the first titratable residue in the fixture rather than
+        # assuming residue 1 is one - which one it is doesn't matter, only
+        # that the override mechanism reaches the written atoms correctly.
+        seen = set()
+        first_resnum = first_resname = None
+        for l in lines:
+            if not l.startswith('ATOM'):
+                continue
+            resnum, resname = l[22:26], l[17:20].strip()
+            if resnum in seen:
+                continue
+            seen.add(resnum)
+            if resname in protonator.PROPKA_VARIANTS:
+                first_resnum, first_resname = resnum, resname
+                break
+        if first_resname is None:
+            self.skipTest('fixture has no titratable residue this test can target')
+
+        source = _write(self.path('in.pdb'), lines)
+
+        class FakeAtom:
+            chain_id = 'A'
+            res_num = int(first_resnum)
+        class FakeGroup:
+            residue_type = first_resname
+            atom = FakeAtom()
+            pka_value = 99.0  # forces the protonated variant regardless of pH
+        class FakeConformation:
+            groups = [FakeGroup()]
+        class FakeMolecule:
+            conformations = {'AVR': FakeConformation()}
+
+        with mock.patch('propka.run.single', return_value=FakeMolecule()):
+            result = protonator.add_hydrogens(source, self.path('out.pdb'),
+                                              ph=7.4, use_propka=True)
+
+        self.assertTrue(result['propka_used'])
+        self.assertEqual(len(result['propka_adjustments']), 1)
+        protonated_variant = protonator.PROPKA_VARIANTS[first_resname][0]
+        # HIS's "protonated" variant (HIP) has hydrogens on both ring
+        # nitrogens where the neutral tautomers only have one - check for
+        # that rather than a single atom name that varies by variant.
+        written = pathlib.Path(self.path('out.pdb')).read_text().splitlines()
+        residue_atoms = {l[12:16].strip() for l in written
+                         if l.startswith('ATOM') and l[22:26] == first_resnum}
+        if protonated_variant == 'HIP':
+            self.assertTrue({'HD1', 'HE2'} <= residue_atoms)
+        elif protonated_variant == 'ASH':
+            self.assertTrue({'HD2'} & residue_atoms)
+        elif protonated_variant == 'GLH':
+            self.assertTrue({'HE2'} & residue_atoms)
+        elif protonated_variant == 'LYS':
+            self.assertEqual(sum(1 for a in residue_atoms if a.startswith('HZ')), 3)
 
 
 class TestMinimizer(TempDirTest):

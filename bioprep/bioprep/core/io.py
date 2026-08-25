@@ -193,6 +193,33 @@ def ensure_pdb(input_path, workdir=None):
     return output_path, 'mmcif'
 
 
+def normalize_element_column_case(pdb_path):
+    """
+    Upper-case the element column (77-78) of every ATOM/HETATM line in place.
+
+    RCSB and this project's own SpecCompliantPDBIO write 'ZN'; OpenMM's
+    PDBFile.writeFile - used for every post-protonation and post-minimisation
+    write - writes 'Zn'. Both identify the correct element to every tool this
+    project checked (OpenMM, OpenBabel), so this was previously left alone
+    deliberately (see BACKEND_AUDIT.md); it is fixed here only because doing
+    so is now nearly free, not because anything downstream actually needed it.
+    """
+    with open(pdb_path, 'r') as fh:
+        lines = fh.readlines()
+
+    changed = False
+    for i, line in enumerate(lines):
+        if line[:6] in ('ATOM  ', 'HETATM') and len(line) >= 78:
+            upper = line[76:78].upper()
+            if upper != line[76:78]:
+                lines[i] = line[:76] + upper + line[78:]
+                changed = True
+
+    if changed:
+        with open(pdb_path, 'w') as fh:
+            fh.writelines(lines)
+
+
 class SpecCompliantPDBIO(PDBIO):
     """
     PDBIO that puts the element symbol where the PDB specification puts it.

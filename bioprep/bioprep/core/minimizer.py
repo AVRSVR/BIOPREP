@@ -25,6 +25,7 @@ from openmm import app
 from openmm import unit
 
 from .residues import is_force_field_safe
+from .io import normalize_element_column_case
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +331,7 @@ def _merge_coords_by_name(pdb, minimised_topology, minimised_positions):
 def _write(path, topology, positions):
     with open(path, 'w') as fh:
         app.PDBFile.writeFile(topology, positions, fh, keepIds=True)
+    normalize_element_column_case(path)
 
 
 def minimize_structure(input_pdb_path, output_pdb_path,
