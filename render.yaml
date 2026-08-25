@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: bioprep
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: BIOPREP_PUBLIC_DEMO
+        value: "1"

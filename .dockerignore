@@ -1,0 +1,16 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.egg-info
+bioprep/processed_data
+bioprep/jobs_history.json
+bioprep/templates_store.json
+bioprep/tmp_test_hets
+bioprep/test_*.pdb
+bioprep/test.pdbqt
+bioprep/1crn_cleaned.pdb
+verification
+tests
+BACKEND_AUDIT.md
+bioprep_technical_pitch.md
