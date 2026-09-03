@@ -12,3 +12,12 @@ tmp_test_hets/
 # stale PowerShell capture files from old runs
 bioprep/error.txt
 bioprep/test_out.txt
+
+# scratch structures from ad-hoc runs (1crn.pdb is a real test fixture, keep it)
+bioprep/test_*.pdb
+bioprep/test.pdb
+bioprep/test.pdbqt
+bioprep/1crn_cleaned.pdb
+bioprep/templates_store.json
+server_live.log
+tunnel.log

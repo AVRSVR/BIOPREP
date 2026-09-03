@@ -1,27 +1,20 @@
-# BioPrep
+# BioPrep (package)
 
-BioPrep is a Python command-line tool for preparing protein structures for molecular docking. It performs essential preprocessing steps on PDB files to ensure they are clean, properly protonated, and ready for computational analysis.
+This is the installable package. See the [project README](../README.md) for what
+BioPrep does, how to run it, and the engineering notes.
 
-## Features
-- Removes water molecules (HOH)
-- Removes ligands and heteroatoms, keeping only standard protein chains
-- Allows selection of a specific protein chain
-- Adds missing hydrogens at a requested physiological pH (default: 7.4) using `pdbfixer`
+## Install
 
-## Installation
-You can install this via pip:
 ```bash
 pip install -e .
 ```
-This requires `conda` to install `pdbfixer` and `openmm` successfully in most environments.
 
-## Usage
-Basic usage to clean a structure and protonate at pH 7.4:
-```bash
-bioprep --input raw_structure.pdb --output cleaned_structure.pdb
-```
+Exposes two entry points:
 
-Select a specific chain (e.g., Chain A) and adjust the pH to 7.0:
-```bash
-bioprep --input raw_structure.pdb --output cleaned_structure.pdb --chain A --ph 7.0
-```
+- `bioprep` — the CLI (`bioprep --input in.pdb --output out.pdb --chain A --minimize`)
+- `bioprep-web` — the Flask web app
+
+Mutable state (job history, saved templates, processed structures) is written to
+`BIOPREP_DATA_DIR`, defaulting to the working directory — deliberately not
+inside the package, since `site-packages` is frequently read-only and
+reinstalling would otherwise delete it.
