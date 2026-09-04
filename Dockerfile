@@ -27,10 +27,15 @@ ENV BIOPREP_PUBLIC_DEMO=1
 RUN mkdir -p /app/data
 
 EXPOSE 8000
-# Single worker: this app's own request-time compute (minimisation) is
-# CPU/GPU-bound already: more workers would just contend for the same core
-# rather than add real throughput, and cost more memory doing it. One long
-# timeout because a real minimisation run legitimately takes minutes, not
-# the framework's usual few seconds. Shell form so $PORT (set by the hosting
-# platform) actually expands; falls back to 8000 for a local docker run.
-CMD gunicorn --workers 1 --timeout 600 --bind 0.0.0.0:${PORT:-8000} bioprep.webapp:app
+# A single sync worker was tried first and found the hard way: one visitor
+# hitting docking export (an OpenBabel subprocess call) wedged that worker,
+# and since it's the *only* one, every other visitor's request - including
+# the plain homepage - queued behind it with nothing else able to answer.
+# gthread keeps the memory footprint close to one process (threads share the
+# already-loaded numpy/scipy/OpenMM import, unlike separate worker
+# processes) while making sure a slow or stuck request no longer blocks
+# everyone else's. One long timeout because a real minimisation run
+# legitimately takes minutes, not the framework's usual few seconds. Shell
+# form so $PORT (set by the hosting platform) actually expands; falls back
+# to 8000 for a local docker run.
+CMD gunicorn --worker-class gthread --workers 1 --threads 4 --timeout 600 --bind 0.0.0.0:${PORT:-8000} bioprep.webapp:app
