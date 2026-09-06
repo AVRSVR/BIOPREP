@@ -1,10 +1,17 @@
 # BioPrep
 
+**Live demo: [bioprep.onrender.com](https://bioprep.onrender.com)** — free tier,
+so it sleeps after 15 minutes idle; the first load after that takes ~30-60s to
+wake up.
+
 Prepares protein structures for molecular docking and MD: clean, protonate,
 repair, energy-minimise, and export to docking-ready formats — through a web UI,
 a CLI, or a batch pipeline.
 
-Everything runs locally. Structures are not uploaded anywhere.
+Run locally (below) and nothing you upload leaves your machine. The hosted
+demo above is a separate deployment for convenience — it processes structures
+on that server, not yours, and disables History/Templates for exactly that
+reason (see `BIOPREP_PUBLIC_DEMO` below).
 
 ---
 
