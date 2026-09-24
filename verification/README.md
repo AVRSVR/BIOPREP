@@ -2,8 +2,8 @@
 
 Two layers, kept separate on purpose.
 
-`tests/test_backend.py` is the regression suite: 132 unit tests, a couple of
-minutes, run it on every change.
+`tests/` is the regression suite: 152 unit tests (144 in `test_backend.py`,
+8 in `test_webapp.py`), a couple of minutes, run it on every change.
 
 This directory checks the claims rather than guarding against regressions.
 Each script verifies one section of the feature catalogue, or one scientific
